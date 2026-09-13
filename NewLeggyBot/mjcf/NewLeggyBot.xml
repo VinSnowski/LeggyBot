@@ -1,0 +1,149 @@
+<mujoco model="NewLeggyBot">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.0025" integrator="implicitfast" solver="Newton"
+          iterations="8" ls_iterations="4" gravity="0 0 -9.81"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0.1 0.1 0.1"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="135" elevation="-18"/>
+  </visual>
+
+  <default>
+    <joint limited="true" damping="0.08" armature="0.002" frictionloss="0.01"/>
+    <geom friction="0.9 0.02 0.002" condim="4" solref="0.01 1"/>
+    <default class="visual">
+      <geom type="mesh" contype="0" conaffinity="0" group="2"
+            rgba="0.72 0.75 0.79 1"/>
+    </default>
+    <default class="collision">
+      <geom group="3" rgba="0.2 0.6 0.9 0.18"/>
+    </default>
+    <default class="sts3215">
+      <joint damping="0.60" frictionloss="0.052" armature="0.028"/>
+      <position kp="17.8" kv="0" forcelimited="true" forcerange="-2.942 2.942"/>
+    </default>
+  </default>
+
+  <asset>
+    <texture name="ground_tex" type="2d" builtin="checker" width="256" height="256"
+             rgb1="0.22 0.25 0.28" rgb2="0.12 0.14 0.16"/>
+    <material name="ground_mat" texture="ground_tex" texrepeat="4 4" reflectance="0.08"/>
+    <mesh name="base_mesh" file="../../LeggyBot/meshes/BaseLink.STL"/>
+    <mesh name="right_hip_mesh" file="../../LeggyBot/meshes/RightHip.STL"/>
+    <mesh name="right_thigh_mesh" file="../../LeggyBot/meshes/RightThigh.STL"/>
+    <mesh name="right_shin_mesh" file="../meshes/RightShin.STL"/>
+    <mesh name="right_foot_mesh" file="../meshes/RightFoot.STL"/>
+    <mesh name="left_hip_mesh" file="../../LeggyBot/meshes/LeftHip.STL"/>
+    <mesh name="left_thigh_mesh" file="../../LeggyBot/meshes/LeftThigh.STL"/>
+    <mesh name="left_shin_mesh" file="../meshes/LeftShin.STL"/>
+    <mesh name="left_foot_mesh" file="../meshes/LeftFoot.STL"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 -1 2" dir="0 0 -1" directional="true"/>
+    <geom name="floor" type="plane" size="0 0 0.05" material="ground_mat"/>
+
+    <body name="BaseLink" pos="0 0 0">
+      <freejoint name="floating_base"/>
+      <inertial pos="-0.0239 0.11149 0.48454" mass="0.542"
+                fullinertia="0.0012936 0.00037886 0.0011305 2.5317e-11 5.4561e-8 -9.6504e-11"/>
+      <geom class="visual" mesh="base_mesh" quat="0.70710678 0 0 -0.70710678"/>
+      <geom name="base_collision" class="collision" type="box"
+            pos="-0.023766 0.11167 0.48675" size="0.0400 0.1118 0.0282"/>
+      <site name="imu" pos="-0.0239 0.11149 0.48454" size="0.006"
+            rgba="1 0.8 0.1 1"/>
+
+      <body name="RightHip" pos="0 0.010073 0.48525" quat="0.5 0.5 -0.5 -0.5">
+        <inertial pos="-0.0001436 -0.033809 0.023766" mass="0.102"
+                  fullinertia="5.2172e-5 4.3682e-5 4.6004e-5 -2.137e-9 3.2038e-11 3.9053e-11"/>
+        <joint name="RightBaseToHip" class="sts3215" axis="0 0 1" range="-0.174533 0.785398"/>
+        <geom class="visual" mesh="right_hip_mesh" pos="-0.00495 -0.00495 0"/>
+        <geom name="right_hip_collision" class="collision" type="box" pos="0 -0.02904 0.02377"
+              size="0.0256 0.0477 0.0267"/>
+        <body name="RightThigh" pos="-0.00495 -0.0666 0.023766">
+          <inertial pos="0.0049489 -0.087073 -0.0002629" mass="0.154"
+                    fullinertia="0.00040883 6.1873e-5 0.00043119 -1.2646e-6 -5.4647e-9 -4.3543e-6"/>
+          <joint name="RightHipToThigh" class="sts3215" axis="1 0 0" range="-1.047198 1.047198"/>
+          <geom class="visual" mesh="right_thigh_mesh"/>
+          <geom name="right_thigh_collision" class="collision" type="capsule" fromto="0 -0.01 0 0 -0.16 0" size="0.018"/>
+          <body name="RightShin" pos="0 -0.1646 0">
+            <inertial pos="0.00495 -0.077346 0.00001" mass="0.061"
+                      fullinertia="0.00026237 2.1178e-5 0.00027738 -2.3624e-11 -2.7099e-13 1.1747e-7"/>
+            <joint name="RightKnee" class="sts3215" axis="1 0 0" range="-2.094395 0.261799"/>
+            <geom class="visual" mesh="right_shin_mesh" pos="-0.01005 -0.168 -0.01"/>
+            <geom name="right_shin_collision" class="collision" type="capsule"
+                  fromto="0 -0.00495 -0.0049497 0 -0.14495 -0.0049497" size="0.018"/>
+            <body name="RightFoot" pos="0.00495 -0.1761898 -0.035136" euler="-1.4312 0 0">
+              <inertial pos="-1.0566e-7 -0.0162 0.0078317" mass="0.069"
+                        fullinertia="0.00021003 3.4562e-5 0.0002338 4.3933e-11 2.8916e-11 8.9283e-6"/>
+              <geom class="visual" mesh="right_foot_mesh"/>
+              <geom name="right_foot_collision" class="collision" type="box"
+                    pos="0 0 0.01486" size="0.0275 0.08 0.01486"/>
+              <site name="right_foot" size="0.008" rgba="1 0.2 0.2 1"/>
+            </body>
+          </body>
+        </body>
+      </body>
+
+      <body name="LeftHip" pos="0 0.21327 0.48525" quat="0.5 0.5 -0.5 -0.5">
+        <inertial pos="-0.0001433 -0.033809 0.023766" mass="0.102"
+                  fullinertia="5.2172e-5 4.3682e-5 4.6004e-5 -2.137e-9 3.2039e-11 3.9054e-11"/>
+        <joint name="LeftBaseToHip" class="sts3215" axis="0 0 1" range="-0.785398 0.174533"/>
+        <geom class="visual" mesh="left_hip_mesh"/>
+        <geom name="left_hip_collision" class="collision" type="box" pos="0 -0.02904 0.02377"
+              size="0.0256 0.0477 0.0267"/>
+        <body name="LeftThigh" pos="0 -0.0666 0.023766">
+          <inertial pos="-8.1405e-7 -0.087073 -0.0002629" mass="0.154"
+                    fullinertia="0.00040883 6.1873e-5 0.00043119 -1.2646e-6 -5.4647e-9 -4.3543e-6"/>
+          <joint name="LeftHipToThigh" class="sts3215" axis="1 0 0" range="-1.047198 1.047198"/>
+          <geom class="visual" mesh="left_thigh_mesh"/>
+          <geom name="left_thigh_collision" class="collision" type="capsule" fromto="0 -0.01 0 0 -0.16 0" size="0.018"/>
+          <body name="LeftShin" pos="0 -0.1646 0">
+            <inertial pos="-2.7448e-7 -0.077346 0.00001" mass="0.061"
+                      fullinertia="0.00026237 2.1178e-5 0.00027738 -2.3624e-11 -2.7099e-13 1.1747e-7"/>
+            <joint name="LeftKnee" class="sts3215" axis="1 0 0" range="-2.094395 0.261799"/>
+            <geom class="visual" mesh="left_shin_mesh" pos="-0.015 -0.168 -0.01"/>
+            <geom name="left_shin_collision" class="collision" type="capsule"
+                  fromto="0 -0.00495 -0.0049497 0 -0.14495 -0.0049497" size="0.018"/>
+            <body name="LeftFoot" pos="0 -0.1761898 -0.035136" euler="-1.4312 0 0">
+              <inertial pos="-1.0565e-7 -0.0162 0.0078317" mass="0.069"
+                        fullinertia="0.00021003 3.4562e-5 0.0002338 4.3951e-11 2.8907e-11 8.9283e-6"/>
+              <geom class="visual" mesh="left_foot_mesh"/>
+              <geom name="left_foot_collision" class="collision" type="box"
+                    pos="0 0 0.01486" size="0.0275 0.08 0.01486"/>
+              <site name="left_foot" size="0.008" rgba="0.2 0.8 1 1"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="right_hip_roll" class="sts3215" joint="RightBaseToHip"
+              ctrlrange="-0.174533 0.785398"/>
+    <position name="right_thigh" class="sts3215" joint="RightHipToThigh"
+              ctrlrange="-1.047198 1.047198"/>
+    <position name="right_knee" class="sts3215" joint="RightKnee"
+              ctrlrange="-2.094395 0.261799"/>
+    <position name="left_hip_roll" class="sts3215" joint="LeftBaseToHip"
+              ctrlrange="-0.785398 0.174533"/>
+    <position name="left_thigh" class="sts3215" joint="LeftHipToThigh"
+              ctrlrange="-1.047198 1.047198"/>
+    <position name="left_knee" class="sts3215" joint="LeftKnee"
+              ctrlrange="-2.094395 0.261799"/>
+  </actuator>
+
+  <equality>
+    <weld name="inspection_base_weld" body1="BaseLink" active="false"/>
+  </equality>
+
+  <sensor>
+    <framequat name="base_orientation" objtype="body" objname="BaseLink"/>
+    <gyro name="imu_ang_vel" site="imu"/>
+    <velocimeter name="imu_lin_vel" site="imu"/>
+    <accelerometer name="base_accelerometer" site="imu"/>
+    <subtreeangmom name="root_angmom" body="BaseLink"/>
+  </sensor>
+</mujoco>
