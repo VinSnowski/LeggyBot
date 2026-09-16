@@ -22,14 +22,26 @@ def _rsl_actor(checkpoint: dict) -> torch.nn.Module:
     return _RslActor(checkpoint["actor_state_dict"])
 
 
-def _load_actor(path: Path, device: torch.device) -> tuple[torch.nn.Module, str | None]:
+def _load_actor(
+    path: Path, device: torch.device
+) -> tuple[torch.nn.Module, str | None, int]:
     checkpoint = torch.load(path.expanduser().resolve(), map_location=device, weights_only=False)
     if "model_state_dict" in checkpoint:
         model, checkpoint = load_custom_policy(path.expanduser().resolve(), device)
-        return model, checkpoint.get("task_id")
+        common_step_counter = checkpoint.get("infos", {}).get("env_state", {}).get(
+            "common_step_counter", 0
+        )
+        return model, checkpoint.get("task_id"), int(common_step_counter)
     if "actor_state_dict" not in checkpoint:
         raise ValueError(f"Unsupported checkpoint format: {path}")
-    return _rsl_actor(checkpoint).to(device).eval(), checkpoint.get("task_id")
+    common_step_counter = checkpoint.get("infos", {}).get("env_state", {}).get(
+        "common_step_counter", 0
+    )
+    return (
+        _rsl_actor(checkpoint).to(device).eval(),
+        checkpoint.get("task_id"),
+        int(common_step_counter),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,7 +77,7 @@ def main() -> int:
         raise ValueError("--task must be an implemented locomotion task")
     task = get_locomotion_task(args.task)
     device = _device(args.device)
-    actor, checkpoint_task = _load_actor(args.checkpoint, device)
+    actor, checkpoint_task, common_step_counter = _load_actor(args.checkpoint, device)
     if checkpoint_task is not None and checkpoint_task != args.task:
         raise ValueError(
             f"checkpoint task {checkpoint_task!r} does not match --task {args.task!r}"
@@ -81,6 +93,7 @@ def main() -> int:
 
     env = ManagerBasedRlEnv(cfg=env_cfg, device=str(device))
     try:
+        env.common_step_counter = common_step_counter
         observations, _ = env.reset(seed=args.seed)
         command_term = env.command_manager.get_term("twist")
         if args.sagittal_command is not None:

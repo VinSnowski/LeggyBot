@@ -21,6 +21,18 @@ class NumpyPolicy(Protocol):
     def __call__(self, observation: np.ndarray) -> np.ndarray: ...
 
 
+def bounded_policy_action(policy: NumpyPolicy, observation: np.ndarray) -> np.ndarray:
+    """Match the training wrapper before applying AND remembering an action.
+
+    Clipping only the joint target leaves raw network outputs in the next
+    observation, which is a different closed-loop policy from training.
+    """
+    action = policy(observation)
+    if not np.isfinite(action).all():
+        raise ValueError("Policy returned a non-finite action")
+    return np.clip(action, -1.0, 1.0)
+
+
 class _TorchPolicy:
     def __init__(
         self,

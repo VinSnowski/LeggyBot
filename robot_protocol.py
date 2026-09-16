@@ -63,6 +63,7 @@ class JointCommand:
     robot_name: str
     joint_names: tuple[str, ...]
     position_target: tuple[float, ...]
+    velocity_command: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def validate(self) -> None:
         if self.sequence < 0 or self.created_time_ns < 0:
@@ -72,6 +73,7 @@ class JointCommand:
         if len(set(self.joint_names)) != len(self.joint_names):
             raise ValueError("command contains duplicate joint names")
         _finite_vector("position_target", self.position_target, len(self.joint_names))
+        _finite_vector("velocity_command", self.velocity_command, 3)
 
 
 WireMessage = RawRobotState | JointCommand
@@ -100,6 +102,7 @@ def decode_message(payload: bytes) -> WireMessage:
         "imu_linear_acceleration",
         "base_orientation_wxyz",
         "position_target",
+        "velocity_command",
     ):
         if key in raw and raw[key] is not None:
             raw[key] = tuple(raw[key])

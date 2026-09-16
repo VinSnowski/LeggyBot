@@ -48,13 +48,25 @@ intentional compatibility breakage from protocol v1; update simulator and
 controller together.
 
 The controller terminal accepts W/S for forward velocity, A/D for lateral
-velocity, Q/E for yaw rate, and X to zero the command. For a fixed command or a
-non-interactive process, use `--no-keyboard --vx 0.5`.
+velocity, Q/E for yaw rate, and X to zero the command. Each keypress changes its
+command by 0.01. Forward/lateral velocity is bounded to +/-0.10 m/s and yaw
+rate to `+/-pi/4` rad/s. For a fixed command or a
+non-interactive process, use `--no-keyboard --vx 0.08`.
 
 Defaults use UDP command port 15000, UDP state port 15001, 200 Hz physics/state
 publication, and 50 Hz policy control. Hosts, ports, frequencies, rendering and
-watchdog deadlines are configurable through `--help`. Bind to `127.0.0.1` rather
-than `0.0.0.0` when external access is unnecessary.
+watchdog deadlines are configurable through `--help`. The simulator prints a
+body-frame velocity comparison at 5 Hz by default:
+
+```text
+body_velocity actual=[+0.032 -0.001 +0.000 ; +0.000 +0.002 +0.041] command=[+0.050 +0.000 +0.000 ; +0.000 +0.000 +0.000] error=[-0.018 -0.001 +0.000 ; +0.000 +0.002 +0.041]
+```
+
+The first three values are torso linear velocity `(x, y, z)` and the last
+three are torso angular velocity `(x, y, z)`. The command is the controller's
+keyboard target, with yaw placed in angular `z`; `error` is actual minus
+command. Use `--velocity-print-hz 0` to disable it or choose another rate.
+Bind to `127.0.0.1` rather than `0.0.0.0` when external access is unnecessary.
 
 ## Frequency and clock model
 

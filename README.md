@@ -1,5 +1,98 @@
 # LeggyBot locomotion manual
 
+For the forward/lateral/curve tracking baseline, see
+[omnidirectional diagnostics and SE2TrackingWalkingTask](../OMNI_WALKING_DIAGNOSTICS.md).
+It includes measured v2 failures, the new task design, and training/evaluation commands.
+The current task is `NaturalOmnidirectionalWalkingTaskV3`. It ports the proven
+Natural reward to mutually exclusive standing, forward, lateral,
+forward-plus-yaw, and backward commands. It adds stronger pitch-upright
+shaping and a small double-support lateral foot-line cost, while preserving
+Natural's PPO settings:
+
+```bash
+uv run python -m locomotion.train_rsl_rl \
+  --task NaturalOmnidirectionalWalkingTaskV3 --num-envs 4096 \
+  --iterations 1500 --run-name natural-v3-from-zero
+```
+
+The command proportions are 10% stop, 30% forward, 10% backward, 20% lateral,
+and 30% curved forward. During pure lateral commands the foot-line penalty
+discourages scissoring without constraining the swing phase. The task is
+intended to train from a blank policy.
+
+V3 pairs servo gain, effort-limit, encoder-bias and delay samples through
+iteration 500. It restores nominal leg inertias on each reset and varies torso
+mass, central inertia and fore/aft/vertical COM without changing lateral COM.
+From iterations 500–800 it interpolates physical pseudo-inertia matrices and
+continuous servo parameters toward full independent samples. Discrete delay
+mismatch is introduced in a growing fraction of environments. From iteration
+800 onward resets use the original full independent randomization. Episodes
+retain their samples until reset. `independent_ramp_steps=0` keeps the optional
+hard switch; `full_domain_randomization` remains directly callable.
+
+Signed TensorBoard metrics include zeros for inactive modes. For a conditional
+left/right success estimate, divide the averaged signed `tracking_success` by
+the averaged matching `command_fraction`; use the same ratio for signed
+`foot_line_error_m`. Omit intervals whose command fraction is zero. These
+ratios retain TensorBoard's episode weighting. Raw signed metrics are not
+conditional success rates or conditional mean foot separation.
+
+The Huber lateral cost remains unsaturated for large errors. Its larger scale
+means it penalizes small offsets less strongly than the earlier exponential
+cost; the larger reward weight does not make it uniformly stronger. This
+shaping choice is retained while testing the corrected randomization.
+
+The paper-style walking ablation is `PeriodicRewardCompositionWalkingTask`.
+It trains one MLP policy from zero on mutually exclusive forward and lateral
+commands: 45% forward, 45% lateral (left or right), and 10% stopped.  Its
+sampler always sets yaw to zero and never makes both `vx` and `vy` nonzero.
+Gait shaping consists only of smooth phase-weighted swing-foot force and
+stance-foot velocity costs, following Siekmann et al.'s periodic reward
+composition.  It intentionally has no scheduled-contact bonus, joint-motion
+reference, curve command, or path-displacement reward.  The two bounded
+velocity-error terms retain the paper kernel with a larger `-1.20` weight.
+
+```bash
+uv run python -m locomotion.train_rsl_rl \
+  --task PeriodicRewardCompositionWalkingTask --num-envs 4096 \
+  --iterations 1600 --run-name prc-walking-velocity-1p2-from-zero
+```
+
+Evaluate its four relevant modes with:
+
+```bash
+uv run python -m locomotion.evaluate_omni_run \
+  logs/rsl_rl/leggybot_periodic_reward_composition_walking/<run-directory>
+```
+
+Watch any compatible checkpoint in raw CPU MuJoCo with a fixed 55-second,
+50 Hz sequence covering stand, forward, backward, both lateral directions,
+and forward-plus-yaw:
+
+```bash
+uv run python -m locomotion.watch_policy_sequence \
+  logs/rsl_rl/<experiment>/<run>/model_<iteration>.pt
+```
+
+The task keeps the deployment-compatible 29-value observation and six-position
+action ABI.  Its MLP and fixed servo gains are the first controlled reward
+ablation; recurrent inference and policy-controlled PD gains are outside this
+experiment.
+
+Evaluate and rank every saved checkpoint in one omnidirectional run with:
+
+```bash
+uv run python -m locomotion.evaluate_omni_run \
+  logs/rsl_rl/leggybot_natural_omnidirectional_walking_v3/<run-directory>
+```
+
+The command writes JSON and Markdown reports under `artifacts/omni_diagnostics`.
+For V3 it evaluates stop, forward, backward, left, right, and both signed
+forward-plus-yaw curves. It also checks the lateral foot-line objective in both
+lateral modes. The paper-style axis-exclusive task requires stop, forward,
+left, and right. All moving modes include stability, drift, orientation, and
+bilateral-step checks.
+
 This is the operational guide for the MuJoCo model, PPO training, policy
 evaluation, native simulation, and controller interface. The project has one
 rule: a training run receives a task ID; the task owns its environment, reward,
@@ -70,16 +163,59 @@ for the next task.
 | 6R | `Mjlab-SymmetricPeriodicWalk-LeggyBot-FixedAnkle6DOF` | Symmetric correction run using cycle-level net lateral/yaw drift for forward-credit gating, while retaining a weak instantaneous motion-safety bound. | Same periodic-walk score ≥ 0.65 after a 2 s warm-up and survival ≥ 0.90; also inspect `cycle_straightness_gate`, cycle lateral-drift cost, and cycle yaw-rate cost. |
 | 7 | `Mjlab-Sagittal-LeggyBot-FixedAnkle6DOF` | Forward/backward speed tracking, acceleration, and braking. | Speed score ≥ 0.70 and survival ≥ 0.90. |
 
+### Independent default walking task
+
+`UpdatedDefaultWalkingTask` is a standalone NewLeggyBot task, not a stage in the
+promotion sequence above. It keeps the existing actor inputs and action space,
+starts its velocity curriculum at 0.075–0.085 m/s and expands it to 0–0.1 m/s
+over 12,000 environment steps. It can start from the 0.08 m/s policy with
+`--initialize-from`; when that option is omitted it starts from a fresh policy.
+It pairs left/right randomization during the first 12,000 environment steps, and
+then enables the full sim-to-real randomization envelope. Its 60-second episodes evaluate
+unwrapped heading and accumulated lateral drift, while its walking rewards use
+cycle-level drift, a ramped bounded path-deviation penalty, and scheduled contact
+rather than instantaneous lateral-velocity suppression.
+
+Start it from an empty policy with:
+
+```bash
+TASK=UpdatedDefaultWalkingTask
+uv run python -m locomotion.train_rsl_rl \
+  --task "$TASK" --iterations 4000 --run-name updated-default-walking
+```
+
+`UpdatedDefaultLateralWalkingTask` continues the completed default walker into
+left/right and diagonal velocity commands. It starts with the final forward
+range `[0, 0.1]` m/s, expands `vy` from zero to `[-0.1, 0.1]` m/s over 24,000
+environment steps, and continues resampling commands every 4–8 seconds. Its
+cycle and long-horizon path errors integrate every command segment. At `vy=0`,
+the lateral terms reduce to the completed default task's straight-walking
+terms; 35% of sampled commands retain exactly zero lateral velocity.
+
+Initialize it from the completed forward curriculum:
+
+```bash
+TASK=UpdatedDefaultLateralWalkingTask
+CHECKPOINT=logs/rsl_rl/leggybot_updated_default_walking/2026-09-13_06-56-49_updated-default-walking-velocity-curriculum/0_010_checkpoint.pt
+
+uv run python -m locomotion.train_rsl_rl \
+  --task "$TASK" --iterations 4000 \
+  --run-name updated-default-lateral-walking \
+  --initialize-from "$CHECKPOINT"
+```
+
 Tasks 4A and 4B are alternatives initialized from the same successful stepping
 policy. Compare their evaluator result and native simulation; promote only the
 one that truly alternates legs without a twitching or dragging exploit. The
 values above are promotion gates, not a substitute for observing the policy in
 simulation.
 
-All implemented tasks use the same active sim-to-real envelope: foot friction,
+The promotion tasks use the same active sim-to-real envelope: foot friction,
 mass/inertia, actuator PD gains and effort limits, encoder bias, 0–10 ms command
-latency, IMU/joint observation noise, and small pushes. The current backlash
-placeholder is deliberately disabled until an assembled joint is measured.
+latency, IMU/joint observation noise, and small pushes. `UpdatedDefaultWalkingTask`
+uses paired left/right actuator and encoder variation for its first 12,000 steps,
+then the same full envelope. The current backlash placeholder is deliberately
+disabled until an assembled joint is measured.
 
 ## Train any task
 
@@ -255,7 +391,7 @@ uv run python -m locomotion.mujoco_robot_server \
   --robot leggybot-fixed-ankle-6dof \
   --command-bind 127.0.0.1 --command-port 15000 \
   --controller-host 127.0.0.1 --state-port 15001 \
-  --state-hz 200 --render-hz 60
+  --state-hz 200 --render-hz 60 --velocity-print-hz 1
 ```
 
 Start the controller in terminal 2:
@@ -271,7 +407,9 @@ uv run python -m locomotion.remote_controller "$CHECKPOINT" \
 ```
 
 Use `W/S` for forward/backward command, `A/D` for lateral command, `Q/E` for
-yaw, `X` to stop, and `Enter` to reset. A task may not have been trained for
+yaw, `X` to stop, and `Enter` to reset. Each keypress changes the command by
+0.01. Forward/lateral velocity is bounded to +/-0.10 m/s and yaw rate to
+`+/-pi/4` rad/s. A task may not have been trained for
 every keyboard command; both short-walk tasks should be tested first with
 `vx=0.08`, `vy=0`, `yaw=0`.
 
@@ -281,7 +419,8 @@ controller. Add `--headless` to the server when rendering is unnecessary.
 The server publishes state at 200 Hz and the controller acts at 50 Hz. Both use
 their own 100 ms watchdog. The latest state is used; old state and old commands
 are never allowed to queue behind newer data. See [REMOTE_CONTROL.md](REMOTE_CONTROL.md)
-for the protocol, estimation interface, safety boundaries, and hardware notes.
+for the protocol, velocity comparison output, estimation interface, safety
+boundaries, and hardware notes.
 
 ## Other playback options
 

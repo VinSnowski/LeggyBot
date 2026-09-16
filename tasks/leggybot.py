@@ -123,7 +123,18 @@ def get_leggybot_robot_cfg(
         collisions=(_FULL_COLLISION,),
         articulation=EntityArticulationInfoCfg(
             actuators=tuple(
-                XmlActuatorCfg(target_names_expr=(joint_name,))
+                XmlActuatorCfg(
+                    target_names_expr=(joint_name,),
+                    # The STS3215 register update is fast, but BIMO measured
+                    # about 5 ms end-to-end bus delay.  At this model's 400 Hz
+                    # physics rate, 1--3 ticks span 2.5--7.5 ms.  The reset
+                    # randomizer chooses the realization; infrequent buffer
+                    # resampling represents small packet/scheduling jitter.
+                    delay_min_lag=0,
+                    delay_max_lag=3,
+                    delay_hold_prob=1.0,
+                    delay_update_period=20,
+                )
                 for joint_name in profile.joint_names
             ),
             soft_joint_pos_limit_factor=0.90,
@@ -135,7 +146,16 @@ def leggybot_ppo_runner_cfg(
     experiment_name: str = "leggybot_skill",
     *,
     use_symmetry_augmentation: bool = False,
+    symmetry_mirror_loss_coeff: float = 0.0,
+    bounded_exploration: bool = False,
+    exploration_init_std: float | None = None,
+    exploration_std_range: tuple[float, float] = (0.03, 0.40),
+    learning_rate: float = 1e-3,
 ) -> RslRlOnPolicyRunnerCfg:
+    if symmetry_mirror_loss_coeff < 0.0:
+        raise ValueError("symmetry mirror loss coefficient must be non-negative")
+    if exploration_init_std is None:
+        exploration_init_std = 0.15 if bounded_exploration else 0.10
     return RslRlOnPolicyRunnerCfg(
         actor=RslRlModelCfg(
             hidden_dims=(256, 128, 128),
@@ -145,8 +165,13 @@ def leggybot_ppo_runner_cfg(
                 "class_name": "GaussianDistribution",
                 # Enough normalized exploration to discover swing at the 55%
                 # bootstrap range; the curriculum still limits target authority.
-                "init_std": 0.10,
-                "std_type": "scalar",
+                "init_std": exploration_init_std,
+                "std_type": "log" if bounded_exploration else "scalar",
+                **(
+                    {"std_range": exploration_std_range}
+                    if bounded_exploration
+                    else {}
+                ),
             },
         ),
         critic=RslRlModelCfg(
@@ -156,10 +181,10 @@ def leggybot_ppo_runner_cfg(
             value_loss_coef=1.0,
             use_clipped_value_loss=True,
             clip_param=0.2,
-            entropy_coef=0.005,
+            entropy_coef=0.001 if bounded_exploration else 0.01,
             num_learning_epochs=5,
             num_mini_batches=4,
-            learning_rate=1e-3,
+            learning_rate=learning_rate,
             schedule="adaptive",
             gamma=0.99,
             lam=0.95,
@@ -171,11 +196,11 @@ def leggybot_ppo_runner_cfg(
             symmetry_cfg=(
                 {
                     "data_augmentation_func": "locomotion.symmetry:leggybot_left_right_augmentation",
-                    "use_data_augmentation": True,
-                    "use_mirror_loss": False,
-                    "mirror_loss_coeff": 0.0,
+                    "use_data_augmentation": use_symmetry_augmentation,
+                    "use_mirror_loss": symmetry_mirror_loss_coeff > 0.0,
+                    "mirror_loss_coeff": symmetry_mirror_loss_coeff,
                 }
-                if use_symmetry_augmentation
+                if use_symmetry_augmentation or symmetry_mirror_loss_coeff > 0.0
                 else None
             ),
         ),
@@ -248,13 +273,15 @@ def _leggybot_base_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         target_upper=dict(
             zip(LEGGYBOT_FIXED_ANKLE_PROFILE.joint_names, action_upper.tolist(), strict=True)
         ),
-        # Action authority is advanced by the performance curriculum, not by
-        # wall-clock iteration.  Playback always exposes the full safe range.
-        initial_range_fraction=0.55 if not play else 1.0,
+        # Registered skills use the full safe joint range in both training and
+        # playback.  Keeping this identical avoids an otherwise silent policy
+        # to actuator-authority mismatch at evaluation or deployment time.
+        initial_range_fraction=1.0,
         range_ramp_steps=0,
-        # TODO(hardware-id): add a bench-fitted stateful backlash/hysteresis
-        # transmission here.  It is intentionally disabled until target-to-
-        # output measurements exist for an assembled LeggyBot joint.
+        # Stateful gear clearance is randomized by the task reset event.  The
+        # play operator is also the seam where measured per-joint backlash can
+        # replace the current STS3215/BIMO prior later.
+        model_backlash=True,
     )
 
     cfg.commands["twist"] = UniformVelocityCommandCfg(

@@ -18,6 +18,7 @@ class AsymmetricJointPositionActionCfg(JointPositionActionCfg):
     target_upper: dict[str, float]
     initial_range_fraction: float = 1.0
     range_ramp_steps: int = 0
+    model_backlash: bool = True
 
     def build(self, env):
         return AsymmetricJointPositionAction(self, env)
@@ -53,6 +54,11 @@ class AsymmetricJointPositionAction(JointPositionAction):
         # it on the action term makes the policy/deployment mapping unchanged.
         self._range_fraction = self._initial_range_fraction
         nominal = self._entity.data.default_joint_pos[:, self._target_ids]
+        # Half-width of a stateful play operator.  It remains zero in playback
+        # and for tasks without servo randomization; reset events populate it
+        # during sim-to-real training.
+        self._backlash_half_width = torch.zeros_like(self._processed_actions)
+        self._backlash_output = nominal.clone()
         if torch.any(self._target_lower >= nominal[0]) or torch.any(
             self._target_upper <= nominal[0]
         ):
@@ -73,11 +79,44 @@ class AsymmetricJointPositionAction(JointPositionAction):
             range_fraction = self._range_fraction
         normalized = normalized * range_fraction
         nominal = self._entity.data.default_joint_pos[:, self._target_ids]
-        self._processed_actions[:] = nominal + torch.where(
+        requested = nominal + torch.where(
             normalized >= 0.0,
             normalized * (self._target_upper - nominal),
             normalized * (nominal - self._target_lower),
         )
+        if self.cfg.model_backlash:
+            # A play/backlash operator: small reversals inside the gear-train
+            # clearance do not move the output; larger commands take up the
+            # clearance before motion resumes.
+            self._backlash_output[:] = torch.maximum(
+                torch.minimum(
+                    self._backlash_output,
+                    requested + self._backlash_half_width,
+                ),
+                requested - self._backlash_half_width,
+            )
+            self._processed_actions[:] = self._backlash_output
+        else:
+            self._processed_actions[:] = requested
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        super().reset(env_ids)
+        nominal = self._entity.data.default_joint_pos[:, self._target_ids]
+        self._processed_actions[env_ids] = nominal[env_ids]
+        self._backlash_output[env_ids] = nominal[env_ids]
+
+    def set_backlash_half_width(
+        self, half_width: torch.Tensor, env_ids: torch.Tensor
+    ) -> None:
+        """Set per-environment joint backlash radii in radians."""
+        if half_width.shape != (len(env_ids), self.action_dim):
+            raise ValueError(
+                "backlash half-width must have shape "
+                f"({len(env_ids)}, {self.action_dim}), got {tuple(half_width.shape)}"
+            )
+        if torch.any(half_width < 0.0):
+            raise ValueError("backlash half-width cannot be negative")
+        self._backlash_half_width[env_ids] = half_width
 
     def set_range_fraction(self, fraction: float) -> None:
         """Set training-time action authority without changing the policy API."""

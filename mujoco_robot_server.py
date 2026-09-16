@@ -38,28 +38,81 @@ class MujocoRobotServer:
         *,
         state_hz: float = 200.0,
         command_timeout_s: float = 0.1,
+        velocity_print_hz: float = 5.0,
     ):
         if not 0.0 < state_hz <= 1.0 / profile.physics_dt:
             raise ValueError(f"state_hz must be in (0, {1.0 / profile.physics_dt}]")
         if command_timeout_s <= 0.0:
             raise ValueError("command timeout must be positive")
+        if velocity_print_hz < 0.0:
+            raise ValueError("velocity print frequency must be non-negative")
         self.transport = transport
         self.profile = profile
         self.model = make_native_model(profile)
         self.data = mujoco.MjData(self.model)
         self.qpos_addresses, self.dof_addresses = _joint_addresses(self.model, profile)
         self.control_ids = _control_ids(self.model, profile)
+        self.root_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, profile.root_body
+        )
+        if self.root_body_id < 0:
+            raise ValueError(f"MuJoCo model has no root body {profile.root_body!r}")
         self.gyro_address = self._sensor_address(profile.gyro_sensor)
         self.accel_address = self._sensor_address(profile.accelerometer_sensor)
         self.publish_period_s = 1.0 / state_hz
         self.next_publish_time_s = 0.0
         self.command_timeout_ns = round(command_timeout_s * 1.0e9)
+        self.velocity_print_period_s = (
+            0.0 if velocity_print_hz == 0.0 else 1.0 / velocity_print_hz
+        )
+        self.next_velocity_print_time_s = 0.0
+        self.last_velocity_command = np.zeros(3, dtype=np.float64)
         self.last_command_receive_ns: int | None = None
         self.last_command_sequence = -1
         self.state_sequence = 0
         self.timed_out = True
         reset_robot(self.model, self.data, self.qpos_addresses, profile)
         self.data.ctrl[self.control_ids] = profile.array("default_joint_pos")
+
+    def _body_velocity(self) -> np.ndarray:
+        velocity_rot_lin = np.zeros(6, dtype=np.float64)
+        mujoco.mj_objectVelocity(
+            self.model,
+            self.data,
+            mujoco.mjtObj.mjOBJ_BODY,
+            self.root_body_id,
+            velocity_rot_lin,
+            1,
+        )
+        return np.concatenate((velocity_rot_lin[3:], velocity_rot_lin[:3]))
+
+    @staticmethod
+    def _format_velocity(vector: np.ndarray) -> str:
+        return (
+            "["
+            + " ".join(f"{value:+.3f}" for value in vector[:3])
+            + " ; "
+            + " ".join(f"{value:+.3f}" for value in vector[3:])
+            + "]"
+        )
+
+    def _print_velocity_comparison(self) -> None:
+        if self.velocity_print_period_s == 0.0:
+            return
+        if self.data.time + 1.0e-12 < self.next_velocity_print_time_s:
+            return
+        actual = self._body_velocity()
+        command = np.zeros(6, dtype=np.float64)
+        command[:2] = self.last_velocity_command[:2]
+        command[5] = self.last_velocity_command[2]
+        print(
+            "body_velocity "
+            f"actual={self._format_velocity(actual)} "
+            f"command={self._format_velocity(command)} "
+            f"error={self._format_velocity(actual - command)}",
+            flush=True,
+        )
+        self.next_velocity_print_time_s = self.data.time + self.velocity_print_period_s
 
     def _sensor_address(self, name: str) -> int:
         sensor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, name)
@@ -114,6 +167,7 @@ class MujocoRobotServer:
         command = self._accept_latest_command(now_ns)
         if command is not None:
             self.data.ctrl[self.control_ids] = np.asarray(command.position_target)
+            self.last_velocity_command[:] = command.velocity_command
 
         previously_timed_out = self.timed_out
         self.timed_out = (
@@ -128,8 +182,10 @@ class MujocoRobotServer:
             # A real robot driver should additionally cut torque or enter its own
             # certified safe state. The simulator holds this profile's nominal pose.
             self.data.ctrl[self.control_ids] = self.profile.array("default_joint_pos")
+            self.last_velocity_command[:] = 0.0
 
         mujoco.mj_step(self.model, self.data)
+        self._print_velocity_comparison()
         if self.data.time + 1.0e-12 >= self.next_publish_time_s:
             self.transport.send_state(self._make_state(now_ns))
             self.next_publish_time_s += self.publish_period_s
@@ -146,6 +202,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-port", type=int, default=15001)
     parser.add_argument("--state-hz", type=float, default=200.0)
     parser.add_argument("--command-timeout", type=float, default=0.1)
+    parser.add_argument(
+        "--velocity-print-hz",
+        type=float,
+        default=5.0,
+        help="body velocity/command comparison rate; 0 disables it",
+    )
     parser.add_argument("--render-hz", type=float, default=60.0)
     parser.add_argument("--headless", action="store_true")
     return parser.parse_args()
@@ -165,10 +227,12 @@ def main() -> None:
         profile,
         state_hz=args.state_hz,
         command_timeout_s=args.command_timeout,
+        velocity_print_hz=args.velocity_print_hz,
     )
     print(
         f"MuJoCo {profile.name} listening for commands on {transport.local_address}; "
-        f"publishing state to {(args.controller_host, args.state_port)}",
+        f"publishing state to {(args.controller_host, args.state_port)}; "
+        f"velocity comparison={args.velocity_print_hz:g} Hz",
         flush=True,
     )
 

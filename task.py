@@ -64,6 +64,7 @@ def make_env_cfg(
             robot_cfg = cfg.scene.entities["robot"]
             if robot_cfg.articulation is not None:
                 for actuator_cfg in robot_cfg.articulation.actuators:
+                    actuator_cfg.delay_min_lag = 0
                     actuator_cfg.delay_max_lag = 0
         return cfg
 

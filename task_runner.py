@@ -17,6 +17,26 @@ class TaskStampedOnPolicyRunner(VelocityOnPolicyRunner):
     task_id: str
     initialize_actor_only = False
 
+    def _restore_environment_state(self, infos: dict | None) -> None:
+        if not infos:
+            return
+        env_state = infos.get("env_state", {})
+        if "common_step_counter" in env_state:
+            self.env.unwrapped.common_step_counter = env_state[
+                "common_step_counter"
+            ]
+        curriculum_state = env_state.get("curriculum_state", {})
+        manager = getattr(self.env.unwrapped, "curriculum_manager", None)
+        if not manager or not curriculum_state:
+            return
+        for name, state in curriculum_state.items():
+            try:
+                func = manager.get_term_cfg(name).func
+            except (ValueError, AttributeError):
+                continue
+            if hasattr(func, "load_state_dict"):
+                func.load_state_dict(state)
+
     def load(self, path: str, load_cfg=None, strict: bool = True, map_location=None):
         if self.initialize_actor_only:
             checkpoint = torch.load(path, weights_only=False, map_location=map_location)
@@ -37,13 +57,31 @@ class TaskStampedOnPolicyRunner(VelocityOnPolicyRunner):
                 if key in target and not key.endswith(("std_param", "log_std_param"))
             }
             self.alg._raw_actor.load_state_dict(actor_state, strict=False)
-            return checkpoint.get("infos", {})
-        return super().load(path, load_cfg=load_cfg, strict=strict, map_location=map_location)
+            infos = checkpoint.get("infos", {})
+            if checkpoint.get("task_id") == self.task_id:
+                self._restore_environment_state(infos)
+            return infos
+        infos = super().load(path, load_cfg=load_cfg, strict=strict, map_location=map_location)
+        self._restore_environment_state(infos)
+        return infos
 
     def save(self, path: str, infos=None) -> None:
         super().save(path, infos)
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         checkpoint["task_id"] = self.task_id
+        env_state = checkpoint.setdefault("infos", {}).setdefault("env_state", {})
+        manager = getattr(self.env.unwrapped, "curriculum_manager", None)
+        if manager:
+            curriculum_state = {}
+            for name in getattr(manager, "active_terms", []):
+                try:
+                    func = manager.get_term_cfg(name).func
+                except (ValueError, AttributeError):
+                    continue
+                if hasattr(func, "state_dict"):
+                    curriculum_state[name] = func.state_dict()
+            if curriculum_state:
+                env_state["curriculum_state"] = curriculum_state
         torch.save(checkpoint, path)
 
 

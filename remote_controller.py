@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import select
 import sys
@@ -14,7 +15,7 @@ from types import TracebackType
 
 import numpy as np
 
-from locomotion.native_policy import NumpyPolicy, load_native_policy
+from locomotion.native_policy import NumpyPolicy, bounded_policy_action, load_native_policy
 from locomotion.robot_profiles import (
     DEFAULT_ROBOT_NAME,
     LEGGYBOT_FIXED_ANKLE_PROFILE,
@@ -33,6 +34,10 @@ from locomotion.state_estimation import PassthroughStateEstimator, StateEstimato
 
 class TerminalVelocityCommand:
     """Latched W/S, A/D, Q/E commands read from the controller terminal."""
+
+    velocity_step = 0.01
+    linear_velocity_limit = 0.10
+    yaw_velocity_limit = math.pi / 4.0
 
     def __init__(
         self,
@@ -69,39 +74,51 @@ class TerminalVelocityCommand:
         changed = False
         while select.select([sys.stdin], [], [], 0.0)[0]:
             key = sys.stdin.read(1).lower()
-            if key == "w":
-                self.target[0] += 0.1
-            elif key == "s":
-                self.target[0] -= 0.1
-            elif key == "a":
-                self.target[1] += 0.1
-            elif key == "d":
-                self.target[1] -= 0.1
-            elif key == "q":
-                self.target[2] += 0.1
-            elif key == "e":
-                self.target[2] -= 0.1
-            elif key == "x":
-                self.target[:] = 0.0
-            else:
-                continue
-            changed = True
-        self._clamp_target()
+            changed = self.apply_key(key) or changed
         if changed:
             print(
                 f"command vx={self.target[0]:+.2f} "
                 f"vy={self.target[1]:+.2f} yaw={self.target[2]:+.2f}"
             )
 
+    def apply_key(self, key: str) -> bool:
+        if key == "w":
+            self.target[0] += self.velocity_step
+        elif key == "s":
+            self.target[0] -= self.velocity_step
+        elif key == "a":
+            self.target[1] += self.velocity_step
+        elif key == "d":
+            self.target[1] -= self.velocity_step
+        elif key == "q":
+            self.target[2] += self.velocity_step
+        elif key == "e":
+            self.target[2] -= self.velocity_step
+        elif key == "x":
+            self.target[:] = 0.0
+        else:
+            return False
+        self._clamp_target()
+        return True
+
     def _clamp_target(self) -> None:
+        # Match the quasi-omnidirectional task envelope: linear commands are
+        # bounded to +/-0.10 m/s and yaw to +/-pi/4 rad/s.  Do not apply the
+        # legacy profile curvature cap here; it would prevent Q/E from
+        # reaching the task's yaw range (and would couple yaw to vx).
+        limits = np.asarray(
+            (
+                self.linear_velocity_limit,
+                self.linear_velocity_limit,
+                self.yaw_velocity_limit,
+            ),
+            dtype=np.float32,
+        )
         self.target[:] = np.clip(
             self.target,
-            -np.asarray(self.profile.max_velocity_command),
-            np.asarray(self.profile.max_velocity_command),
+            -limits,
+            limits,
         )
-        if self.profile.max_abs_curvature is not None:
-            yaw_limit = self.profile.max_abs_curvature * abs(self.target[0])
-            self.target[2] = np.clip(self.target[2], -yaw_limit, yaw_limit)
 
 
 class PolicyController:
@@ -193,7 +210,7 @@ class PolicyController:
             )
             if observation.shape != (expected_dim,):
                 raise RuntimeError(f"unexpected policy observation shape {observation.shape}")
-            self.last_action = self.policy(observation)
+            self.last_action = bounded_policy_action(self.policy, observation)
             target = self.profile.action_target_from_normalized(
                 self.last_action, self.action_range_fraction
             )
@@ -204,6 +221,7 @@ class PolicyController:
             robot_name=self.profile.name,
             joint_names=self.profile.joint_names,
             position_target=tuple(float(value) for value in target),
+            velocity_command=tuple(float(value) for value in velocity_command),
         )
         self.command_sequence += 1
         return command
@@ -276,7 +294,11 @@ def main() -> None:
         f"sending commands to {(args.robot_host, args.command_port)}",
         flush=True,
     )
-    print("Controller keys: W/S forward, A/D lateral, Q/E yaw, X stop", flush=True)
+    print(
+        "Controller keys: W/S forward, A/D lateral, Q/E yaw, X stop "
+        "(0.01 steps; vx/vy +/-0.10, yaw +/-pi/4)",
+        flush=True,
+    )
 
     next_control_ns = monotonic_time_ns()
     next_status_ns = next_control_ns + 1_000_000_000

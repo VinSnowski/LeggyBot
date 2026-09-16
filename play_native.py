@@ -15,7 +15,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from locomotion.native_policy import NumpyPolicy, load_native_policy
+from locomotion.native_policy import NumpyPolicy, bounded_policy_action, load_native_policy
 from locomotion.robot_profiles import (
     DEFAULT_ROBOT_NAME,
     GO1_PROFILE,
@@ -204,7 +204,7 @@ def benchmark(policy: NumpyPolicy, seconds: float, profile: RobotProfile) -> flo
             observation = build_actor_observation(
                 model, data, qpos_adr, dof_adr, action, command, profile, gait_period
             )
-            action = policy(observation)
+            action = bounded_policy_action(policy, observation)
             apply_policy_action(model, data, ctrl_ids, action, profile)
         mujoco.mj_step(model, data)
     elapsed = time.perf_counter() - started
@@ -259,7 +259,7 @@ def run_viewer(
                     profile,
                     gait_period,
                 )
-                action = policy(observation)
+                action = bounded_policy_action(policy, observation)
                 apply_policy_action(model, data, ctrl_ids, action, profile)
                 for _ in range(profile.control_decimation):
                     mujoco.mj_step(model, data)
