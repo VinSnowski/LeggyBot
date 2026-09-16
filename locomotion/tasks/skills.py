@@ -2036,9 +2036,9 @@ def natural_omnidirectional_v4_env_cfg(play: bool = False) -> ManagerBasedRlEnvC
     command = cfg.commands['twist']
     command.ranges.lin_vel_x = (0.0, .10)
     command.reverse_probability = 0.0
-    command.forward_straight_probability = .30
-    command.forward_curve_probability = .30
-    command.pure_lateral_probability = .30
+    command.forward_straight_probability = .45
+    command.forward_curve_probability = .45
+    command.pure_lateral_probability = .0
     # Remaining proportions: .30 straight, .30 curves, .10 stopped.
     cfg.rewards['lateral_foot_line'] = RewardTermCfg(
         func=commanded_lateral_foot_line_cost, weight=-.20,
@@ -2059,8 +2059,6 @@ def natural_omnidirectional_v4_env_cfg(play: bool = False) -> ManagerBasedRlEnvC
         func=WindowedSE2Tracking,
         params={'horizon_s': 1.0, 'output': 'cross_track_error'},
     )
-    cfg.rewards["linear_tracking"].weight = 4.0
-    cfg.rewards["linear_path_error"].weight = -1.0
     return cfg
 
 

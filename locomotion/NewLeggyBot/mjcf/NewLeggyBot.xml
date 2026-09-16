@@ -29,13 +29,13 @@
     <texture name="ground_tex" type="2d" builtin="checker" width="256" height="256"
              rgb1="0.22 0.25 0.28" rgb2="0.12 0.14 0.16"/>
     <material name="ground_mat" texture="ground_tex" texrepeat="4 4" reflectance="0.08"/>
-    <mesh name="base_mesh" file="../../LeggyBot/meshes/BaseLink.STL"/>
-    <mesh name="right_hip_mesh" file="../../LeggyBot/meshes/RightHip.STL"/>
-    <mesh name="right_thigh_mesh" file="../../LeggyBot/meshes/RightThigh.STL"/>
+    <mesh name="base_mesh" file="../meshes/FloatingBase.STL"/>
+    <mesh name="right_hip_mesh" file="../meshes/RightHip.STL"/>
+    <mesh name="right_thigh_mesh" file="../meshes/RightThigh.STL"/>
     <mesh name="right_shin_mesh" file="../meshes/RightShin.STL"/>
     <mesh name="right_foot_mesh" file="../meshes/RightFoot.STL"/>
-    <mesh name="left_hip_mesh" file="../../LeggyBot/meshes/LeftHip.STL"/>
-    <mesh name="left_thigh_mesh" file="../../LeggyBot/meshes/LeftThigh.STL"/>
+    <mesh name="left_hip_mesh" file="../meshes/LeftHip.STL"/>
+    <mesh name="left_thigh_mesh" file="../meshes/LeftThigh.STL"/>
     <mesh name="left_shin_mesh" file="../meshes/LeftShin.STL"/>
     <mesh name="left_foot_mesh" file="../meshes/LeftFoot.STL"/>
   </asset>
@@ -44,17 +44,25 @@
     <light pos="0 -1 2" dir="0 0 -1" directional="true"/>
     <geom name="floor" type="plane" size="0 0 0.05" material="ground_mat"/>
 
+    <!--
+      BaseLink's free-joint origin is the robot's sagittal center.  The CAD
+      coordinates were exported with that plane at y=0.1116715.  Every direct
+      BaseLink-local physical element is translated by -0.1116715 m in Y;
+      this is a coordinate-frame change only and leaves the assembled robot's
+      relative geometry, mass distribution, and joint transforms unchanged.
+    -->
     <body name="BaseLink" pos="0 0 0">
       <freejoint name="floating_base"/>
-      <inertial pos="-0.0239 0.11149 0.48454" mass="0.542"
+      <inertial pos="-0.0239 -0.0001815 0.48454" mass="0.542"
                 fullinertia="0.0012936 0.00037886 0.0011305 2.5317e-11 5.4561e-8 -9.6504e-11"/>
-      <geom class="visual" mesh="base_mesh" quat="0.70710678 0 0 -0.70710678"/>
+      <geom class="visual" mesh="base_mesh" pos="0 -0.1116715 0"
+            quat="0.70710678 0 0 -0.70710678"/>
       <geom name="base_collision" class="collision" type="box"
-            pos="-0.023766 0.11167 0.48675" size="0.0400 0.1118 0.0282"/>
-      <site name="imu" pos="-0.0239 0.11149 0.48454" size="0.006"
+            pos="-0.023766 -0.0000015 0.48675" size="0.0400 0.1118 0.0282"/>
+      <site name="imu" pos="-0.0239 -0.0001815 0.48454" size="0.006"
             rgba="1 0.8 0.1 1"/>
 
-      <body name="RightHip" pos="0 0.010073 0.48525" quat="0.5 0.5 -0.5 -0.5">
+      <body name="RightHip" pos="0 -0.1015985 0.48525" quat="0.5 0.5 -0.5 -0.5">
         <inertial pos="-0.0001436 -0.033809 0.023766" mass="0.102"
                   fullinertia="5.2172e-5 4.3682e-5 4.6004e-5 -2.137e-9 3.2038e-11 3.9053e-11"/>
         <joint name="RightBaseToHip" class="sts3215" axis="0 0 1" range="-0.174533 0.785398"/>
@@ -86,7 +94,7 @@
         </body>
       </body>
 
-      <body name="LeftHip" pos="0 0.21327 0.48525" quat="0.5 0.5 -0.5 -0.5">
+      <body name="LeftHip" pos="0 0.1015985 0.48525" quat="0.5 0.5 -0.5 -0.5">
         <inertial pos="-0.0001433 -0.033809 0.023766" mass="0.102"
                   fullinertia="5.2172e-5 4.3682e-5 4.6004e-5 -2.137e-9 3.2039e-11 3.9054e-11"/>
         <joint name="LeftBaseToHip" class="sts3215" axis="0 0 1" range="-0.785398 0.174533"/>
