@@ -125,7 +125,7 @@ class TerminalVelocityCommand:
 class JoystickVelocityCommand:
     """Continuous vx/yaw command from the DualSense left analog stick."""
 
-    linear_velocity_limit = 0.20
+    linear_velocity_limit = 0.10
     yaw_velocity_limit = 0.40
     stick_deadzone = 0.08
     yaw_deadband_rad = math.radians(8.0)

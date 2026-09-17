@@ -2028,8 +2028,8 @@ def natural_omnidirectional_v4_env_cfg(play: bool = False) -> ManagerBasedRlEnvC
     """
     cfg = natural_omnidirectional_v3_env_cfg(play)
     command = cfg.commands['twist']
-    command.ranges.lin_vel_x = (0.0, .20)
-    command.protected_forward_range = (.04, .20)
+    command.ranges.lin_vel_x = (0.0, .10)
+    command.protected_forward_range = (.04, .10)
     command.reverse_probability = 0.0
     command.forward_straight_probability = .45
     command.forward_curve_probability = .45
