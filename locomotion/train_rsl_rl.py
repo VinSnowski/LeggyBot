@@ -25,6 +25,11 @@ def parse_args() -> argparse.Namespace:
         "--initialize-from", type=Path,
         help="Initialize only the actor from a previous RSL-RL checkpoint.",
     )
+    parser.add_argument(
+        "--preserve-policy-std",
+        action="store_true",
+        help="With --initialize-from, also retain the learned action standard deviation.",
+    )
     return parser.parse_args()
 
 
@@ -32,6 +37,8 @@ def main() -> None:
     args = parse_args()
     if args.num_envs <= 0 or args.iterations <= 0:
         raise ValueError("num-envs and iterations must be positive")
+    if args.preserve_policy_std and args.initialize_from is None:
+        raise ValueError("--preserve-policy-std requires --initialize-from")
 
     register_tasks()
     # Keep upstream logging/storage behavior, but group the terminal summary
@@ -67,6 +74,7 @@ def main() -> None:
         agent_cfg.load_run = source_run.name
         agent_cfg.load_checkpoint = source.name
         TaskStampedOnPolicyRunner.initialize_actor_only = True
+        TaskStampedOnPolicyRunner.preserve_initialized_policy_std = args.preserve_policy_std
 
     env_cfg = make_env_cfg(
         args.task,
@@ -94,6 +102,7 @@ def main() -> None:
         finally:
             mjlab_train.get_checkpoint_path = original_resolver
             TaskStampedOnPolicyRunner.initialize_actor_only = False
+            TaskStampedOnPolicyRunner.preserve_initialized_policy_std = False
     else:
         launch_training(args.task, config)
 

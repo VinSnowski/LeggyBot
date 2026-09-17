@@ -18,8 +18,17 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
+from locomotion.imu import Icm42688OrientationEstimator
 from locomotion.native_policy import NumpyPolicy, bounded_policy_action, load_native_policy
-from locomotion.play_native import _control_ids, _joint_addresses, build_actor_observation, reset_robot
+from locomotion.observation_latency import ObservationAgeModel
+from locomotion.play_native import (
+    _control_ids,
+    _joint_addresses,
+    build_actor_observation,
+    make_position_profiler,
+    reset_robot,
+    step_native_physics,
+)
 from locomotion.robot_profiles import (
     DEFAULT_ROBOT_NAME,
     RobotProfile,
@@ -27,6 +36,7 @@ from locomotion.robot_profiles import (
     make_native_model,
     robot_choices,
 )
+from locomotion.servo import PositionBasedVelocityEstimator
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +75,10 @@ def command_sequence_for_task(
 ) -> tuple[CommandSegment, ...]:
     sequence = (
         V4_COMMAND_SEQUENCE
-        if task_id == "NaturalOmnidirectionalWalkingTaskV4"
+        if task_id in (
+            "NaturalOmnidirectionalWalkingTaskV4",
+            "NaturalOmnidirectionalWalkingTaskV5",
+        )
         else COMMAND_SEQUENCE
     )
     if no_lateral:
@@ -159,6 +172,10 @@ def run_sequence(
 
     action = np.zeros(profile.action_dim, dtype=np.float32)
     gait_period_s = profile.gait_period_for_task(getattr(policy, "task_id", None))
+    velocity_estimator = PositionBasedVelocityEstimator(profile.control_dt)
+    imu_estimator = Icm42688OrientationEstimator()
+    observation_age = ObservationAgeModel()
+    position_profiler = make_position_profiler(profile)
     sequence = command_sequence_for_task(
         getattr(policy, "task_id", None), no_lateral=no_lateral
     )
@@ -245,13 +262,22 @@ def run_sequence(
                 command,
                 profile,
                 gait_period_s,
+                velocity_estimator,
+                imu_estimator,
+                observation_age,
             )
             action = bounded_policy_action(policy, observation)
-            data.ctrl[control_ids] = profile.action_target_from_normalized(
+            target = profile.action_target_from_normalized(
                 action, action_range_fraction
             )
+            if position_profiler is None:
+                data.ctrl[control_ids] = target
+            else:
+                position_profiler.set_goal(target)
             for _ in range(profile.control_decimation):
-                mujoco.mj_step(model, data)
+                step_native_physics(
+                    model, data, control_ids, profile, position_profiler
+                )
                 physics_steps += 1
             control_step += 1
 

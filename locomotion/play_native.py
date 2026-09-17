@@ -15,7 +15,10 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
+from locomotion.imu import Icm42688OrientationEstimator
 from locomotion.native_policy import NumpyPolicy, bounded_policy_action, load_native_policy
+from locomotion.observation_latency import ObservationAgeModel
+from locomotion.servo import PositionBasedVelocityEstimator, PositionSetpointProfiler
 from locomotion.robot_profiles import (
     DEFAULT_ROBOT_NAME,
     GO1_PROFILE,
@@ -143,6 +146,9 @@ def build_actor_observation(
     command: np.ndarray,
     profile: RobotProfile = LEGGYBOT_FIXED_ANKLE_PROFILE,
     gait_period_s: float | None = None,
+    velocity_estimator: PositionBasedVelocityEstimator | None = None,
+    imu_estimator: Icm42688OrientationEstimator | None = None,
+    observation_age: ObservationAgeModel | None = None,
 ) -> np.ndarray:
     gyro_id = mujoco.mj_name2id(
         model, mujoco.mjtObj.mjOBJ_SENSOR, profile.gyro_sensor
@@ -150,19 +156,61 @@ def build_actor_observation(
     if gyro_id < 0:
         raise ValueError("Native model has no imu_ang_vel sensor")
     gyro_adr = model.sensor_adr[gyro_id]
-    base_ang_vel = data.sensordata[gyro_adr : gyro_adr + 3]
+    accel_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_SENSOR, profile.accelerometer_sensor
+    )
+    if accel_id < 0:
+        raise ValueError("Native model has no accelerometer sensor")
+    accel_adr = model.sensor_adr[accel_id]
+    if imu_estimator is None:
+        # Preserve the legacy Go1 contract. All STS3215 LeggyBot runtimes pass
+        # the real 6-axis estimator explicitly below.
+        base_ang_vel = data.sensordata[gyro_adr : gyro_adr + 3]
+        inverse_quat = data.qpos[3:7].copy()
+        inverse_quat[1:] *= -1.0
+        projected_gravity = np.empty(3, dtype=np.float64)
+        mujoco.mju_rotVecQuat(
+            projected_gravity, np.array([0.0, 0.0, -1.0]), inverse_quat
+        )
+    else:
+        imu_estimator.update(
+            data.sensordata[gyro_adr : gyro_adr + 3],
+            data.sensordata[accel_adr : accel_adr + 3],
+            round(data.time * 1.0e9),
+        )
+        base_ang_vel = imu_estimator.angular_velocity
+        projected_gravity = imu_estimator.projected_gravity
 
-    # qpos uses MuJoCo's wxyz quaternion. Rotate world gravity into the trunk frame.
-    inverse_quat = data.qpos[3:7].copy()
-    inverse_quat[1:] *= -1.0
-    projected_gravity = np.empty(3, dtype=np.float64)
-    mujoco.mju_rotVecQuat(projected_gravity, np.array([0.0, 0.0, -1.0]), inverse_quat)
+    observed_joint_position = profile.observed_joint_position(
+        data.qpos[qpos_addresses]
+    )
+    if profile.position_resolution_rad is None:
+        observed_joint_velocity = data.qvel[dof_addresses]
+    else:
+        if velocity_estimator is None:
+            raise ValueError(
+                "discrete-servo profiles require a position-based velocity estimator"
+            )
+        observed_joint_velocity = velocity_estimator.update(observed_joint_position)
+
+    if observation_age is not None:
+        (
+            base_ang_vel,
+            projected_gravity,
+            observed_joint_position,
+            observed_joint_velocity,
+        ) = observation_age.apply(
+            base_ang_vel,
+            projected_gravity,
+            observed_joint_position,
+            observed_joint_velocity,
+        )
 
     terms = [
             base_ang_vel,
             projected_gravity,
-            data.qpos[qpos_addresses] - profile.array("default_joint_pos"),
-            data.qvel[dof_addresses],
+            observed_joint_position - profile.array("default_joint_pos"),
+            observed_joint_velocity,
             previous_action,
             command,
     ]
@@ -182,9 +230,33 @@ def apply_policy_action(
     control_ids: np.ndarray,
     action: np.ndarray,
     profile: RobotProfile = LEGGYBOT_FIXED_ANKLE_PROFILE,
+    position_profiler: PositionSetpointProfiler | None = None,
 ) -> None:
     target = profile.action_target_from_normalized(action)
-    data.ctrl[control_ids] = target
+    if position_profiler is None:
+        data.ctrl[control_ids] = target
+    else:
+        position_profiler.set_goal(target)
+
+
+def make_position_profiler(
+    profile: RobotProfile,
+) -> PositionSetpointProfiler | None:
+    if profile.position_resolution_rad is None:
+        return None
+    return PositionSetpointProfiler(profile.array("default_joint_pos"))
+
+
+def step_native_physics(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    control_ids: np.ndarray,
+    profile: RobotProfile,
+    position_profiler: PositionSetpointProfiler | None,
+) -> None:
+    if position_profiler is not None:
+        data.ctrl[control_ids] = position_profiler.update(profile.physics_dt)
+    mujoco.mj_step(model, data)
 
 
 def benchmark(policy: NumpyPolicy, seconds: float, profile: RobotProfile) -> float:
@@ -197,16 +269,29 @@ def benchmark(policy: NumpyPolicy, seconds: float, profile: RobotProfile) -> flo
     action = np.zeros(profile.action_dim, dtype=np.float32)
     physics_steps = max(1, round(seconds / profile.physics_dt))
     gait_period = profile.gait_period_for_task(getattr(policy, "task_id", None))
+    velocity_estimator = PositionBasedVelocityEstimator(profile.control_dt)
+    imu_estimator = Icm42688OrientationEstimator()
+    observation_age = (
+        ObservationAgeModel() if profile.position_resolution_rad is not None else None
+    )
+    position_profiler = make_position_profiler(profile)
 
     started = time.perf_counter()
     for step in range(physics_steps):
         if step % profile.control_decimation == 0:
             observation = build_actor_observation(
-                model, data, qpos_adr, dof_adr, action, command, profile, gait_period
+                model, data, qpos_adr, dof_adr, action, command, profile, gait_period,
+                velocity_estimator,
+                imu_estimator,
+                observation_age,
             )
             action = bounded_policy_action(policy, observation)
-            apply_policy_action(model, data, ctrl_ids, action, profile)
-        mujoco.mj_step(model, data)
+            apply_policy_action(
+                model, data, ctrl_ids, action, profile, position_profiler
+            )
+        step_native_physics(
+            model, data, ctrl_ids, profile, position_profiler
+        )
     elapsed = time.perf_counter() - started
     return physics_steps * profile.physics_dt / elapsed
 
@@ -225,6 +310,12 @@ def run_viewer(
     action = np.zeros(profile.action_dim, dtype=np.float32)
     render_period = 1.0 / frame_rate
     gait_period = profile.gait_period_for_task(getattr(policy, "task_id", None))
+    velocity_estimator = PositionBasedVelocityEstimator(profile.control_dt)
+    imu_estimator = Icm42688OrientationEstimator()
+    observation_age = (
+        ObservationAgeModel() if profile.position_resolution_rad is not None else None
+    )
+    position_profiler = make_position_profiler(profile)
 
     with mujoco.viewer.launch_passive(
         model, data, key_callback=keyboard.callback, show_left_ui=False
@@ -246,6 +337,12 @@ def run_viewer(
             if reset_requested:
                 reset_robot(model, data, qpos_adr, profile)
                 action[:] = 0.0
+                velocity_estimator.reset()
+                imu_estimator.reset()
+                if observation_age is not None:
+                    observation_age.reset()
+                if position_profiler is not None:
+                    position_profiler.reset(profile.array("default_joint_pos"))
                 next_control = now
 
             if now >= next_control:
@@ -258,11 +355,23 @@ def run_viewer(
                     command,
                     profile,
                     gait_period,
+                    velocity_estimator,
+                    imu_estimator,
+                    observation_age,
                 )
                 action = bounded_policy_action(policy, observation)
-                apply_policy_action(model, data, ctrl_ids, action, profile)
+                apply_policy_action(
+                    model,
+                    data,
+                    ctrl_ids,
+                    action,
+                    profile,
+                    position_profiler,
+                )
                 for _ in range(profile.control_decimation):
-                    mujoco.mj_step(model, data)
+                    step_native_physics(
+                        model, data, ctrl_ids, profile, position_profiler
+                    )
                 next_control += profile.control_dt
                 if now - next_control > profile.control_dt:
                     # Do not create an unbounded catch-up burst after window stalls.

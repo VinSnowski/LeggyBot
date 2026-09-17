@@ -5,9 +5,19 @@ import json
 import numpy as np
 import mujoco
 import torch
+from locomotion.imu import Icm42688OrientationEstimator
 from locomotion.native_policy import load_native_policy, bounded_policy_action
-from locomotion.play_native import _joint_addresses, _control_ids, reset_robot, build_actor_observation
+from locomotion.observation_latency import ObservationAgeModel
+from locomotion.play_native import (
+    _control_ids,
+    _joint_addresses,
+    build_actor_observation,
+    make_position_profiler,
+    reset_robot,
+    step_native_physics,
+)
 from locomotion.robot_profiles import get_robot_profile, make_native_model
+from locomotion.servo import PositionBasedVelocityEstimator
 
 MODES = {'forward': (.08, 0., 0.), 'left': (0., .06, 0.),
          'right': (0., -.06, 0.), 'curve_left': (.08, 0., .3),
@@ -25,16 +35,31 @@ def rollout(policy, command, phase_offset, seconds):
     reset_robot(model, data, qa, profile)
     action = np.zeros(6, dtype=np.float32)
     period = profile.gait_period_for_task(policy.task_id)
+    velocity_estimator = PositionBasedVelocityEstimator(profile.control_dt)
+    imu_estimator = Icm42688OrientationEstimator()
+    observation_age = ObservationAgeModel(seed=round(1000 * phase_offset))
+    position_profiler = make_position_profiler(profile)
     reference = np.array([*data.qpos[:2], 0.])
     records = []
     for step in range(round(seconds / profile.control_dt)):
-        obs = build_actor_observation(model, data, qa, va, action, np.asarray(command), profile, period)
+        obs = build_actor_observation(
+            model, data, qa, va, action, np.asarray(command), profile, period,
+            velocity_estimator,
+            imu_estimator,
+            observation_age,
+        )
         if phase_offset:
             obs[-2:] *= -1
         action = bounded_policy_action(policy, obs)
-        data.ctrl[controls] = profile.action_target_from_normalized(action)
+        target = profile.action_target_from_normalized(action)
+        if position_profiler is None:
+            data.ctrl[controls] = target
+        else:
+            position_profiler.set_goal(target)
         for _ in range(profile.control_decimation):
-            mujoco.mj_step(model, data)
+            step_native_physics(
+                model, data, controls, profile, position_profiler
+            )
         dt = profile.control_dt
         half = command[2] * dt / 2
         reference[:2] += dt * np.sinc(half / np.pi) * np.array([

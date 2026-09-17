@@ -15,7 +15,7 @@ from typing import Protocol
 
 import numpy as np
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_DATAGRAM_BYTES = 65_507
 
 
@@ -37,13 +37,23 @@ class RawRobotState:
     joint_velocity: tuple[float, ...]
     imu_angular_velocity: tuple[float, float, float]
     imu_linear_acceleration: tuple[float, float, float]
-    # Perfect MuJoCo orientation for the placeholder estimator. A raw-hardware
-    # transport may omit it once an IMU estimator is implemented here.
+    # Optional diagnostic ground truth. The production ICM-42688-P estimator
+    # uses only angular velocity and linear acceleration.
     base_orientation_wxyz: tuple[float, float, float, float] | None
+    # Device-specific acquisition times permit a hardware bridge to publish
+    # latest-wins servo and IMU samples without pretending they are synchronous.
+    joint_sample_time_ns: int | None = None
+    imu_sample_time_ns: int | None = None
 
     def validate(self) -> None:
         if self.sequence < 0 or self.sample_time_ns < 0 or self.sent_time_ns < 0:
             raise ValueError("state sequence and timestamps must be non-negative")
+        for name, timestamp in (
+            ("joint_sample_time_ns", self.joint_sample_time_ns),
+            ("imu_sample_time_ns", self.imu_sample_time_ns),
+        ):
+            if timestamp is not None and timestamp < 0:
+                raise ValueError(f"{name} must be non-negative")
         if not self.robot_name:
             raise ValueError("robot_name must not be empty")
         if len(set(self.joint_names)) != len(self.joint_names):

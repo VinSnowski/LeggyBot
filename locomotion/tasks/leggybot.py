@@ -35,6 +35,11 @@ from mjlab.utils.spec_config import CollisionCfg
 
 from locomotion.robot_profiles import LEGGYBOT_FIXED_ANKLE_PROFILE, LEGGYBOT_PROFILE
 from locomotion.actions import AsymmetricJointPositionActionCfg
+from locomotion.servo import (
+    STS3215_MAX_PROFILE_ACCELERATION_RAD_S2,
+    STS3215_MAX_PROFILE_SPEED_RAD_S,
+    STS3215_POSITION_RESOLUTION_RAD,
+)
 from locomotion.tasks.rewards import (
     command_direction_progress,
     uncommanded_base_angular_velocity,
@@ -125,15 +130,14 @@ def get_leggybot_robot_cfg(
             actuators=tuple(
                 XmlActuatorCfg(
                     target_names_expr=(joint_name,),
-                    # The STS3215 register update is fast, but BIMO measured
-                    # about 5 ms end-to-end bus delay.  At this model's 400 Hz
-                    # physics rate, 1--3 ticks span 2.5--7.5 ms.  The reset
-                    # randomizer chooses the realization; infrequent buffer
-                    # resampling represents small packet/scheduling jitter.
+                    # Command timing is modeled once for the synchronized bus
+                    # packet by AsymmetricJointPositionAction. Per-actuator
+                    # buffers would duplicate latency and let paired joints
+                    # receive one packet at different times.
                     delay_min_lag=0,
-                    delay_max_lag=3,
+                    delay_max_lag=0,
                     delay_hold_prob=1.0,
-                    delay_update_period=20,
+                    delay_update_period=0,
                 )
                 for joint_name in profile.joint_names
             ),
@@ -282,6 +286,15 @@ def _leggybot_base_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         # play operator is also the seam where measured per-joint backlash can
         # replace the current STS3215/BIMO prior later.
         model_backlash=True,
+        target_resolution_rad=STS3215_POSITION_RESOLUTION_RAD,
+        # At 200 Hz, seven physics ticks cover the 5--15 ms base delay, one
+        # tick of jitter, and a rare additional 20 ms late control frame.
+        command_delay_max_steps=7,
+        command_delay_hold_probability=0.9,
+        missed_frame_probability=0.01,
+        model_firmware_profile=True,
+        firmware_max_velocity_rad_s=STS3215_MAX_PROFILE_SPEED_RAD_S,
+        firmware_max_acceleration_rad_s2=STS3215_MAX_PROFILE_ACCELERATION_RAD_S2,
     )
 
     cfg.commands["twist"] = UniformVelocityCommandCfg(

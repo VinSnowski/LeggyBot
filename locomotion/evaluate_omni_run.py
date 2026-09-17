@@ -24,6 +24,7 @@ from locomotion.tasks.skills import (
     NATURAL_OMNIDIRECTIONAL_TASK_ID,
     NATURAL_OMNIDIRECTIONAL_V3_TASK_ID,
     NATURAL_OMNIDIRECTIONAL_V4_TASK_ID,
+    NATURAL_OMNIDIRECTIONAL_V5_TASK_ID,
     PERIODIC_REWARD_COMPOSITION_WALKING_TASK_ID,
     QUASI_OMNIDIRECTIONAL_WALKING_TASK_ID,
     QUASI_OMNIDIRECTIONAL_WALKING_V2_TASK_ID,
@@ -51,6 +52,11 @@ V3_COMMANDS: dict[str, tuple[float, float, float]] = {
     "curve_right": COMMANDS["curve_right"],
 }
 
+V4_COMMANDS: dict[str, tuple[float, float, float]] = {
+    name: COMMANDS[name]
+    for name in ("stop", "forward", "curve_left", "curve_right")
+}
+
 AXIS_EXCLUSIVE_COMMANDS: dict[str, tuple[float, float, float]] = {
     name: COMMANDS[name] for name in ("stop", "forward", "left", "right")
 }
@@ -59,11 +65,23 @@ SUPPORTED_TASKS = {
     NATURAL_OMNIDIRECTIONAL_TASK_ID,
     NATURAL_OMNIDIRECTIONAL_V3_TASK_ID,
     NATURAL_OMNIDIRECTIONAL_V4_TASK_ID,
+    NATURAL_OMNIDIRECTIONAL_V5_TASK_ID,
     PERIODIC_REWARD_COMPOSITION_WALKING_TASK_ID,
     QUASI_OMNIDIRECTIONAL_WALKING_TASK_ID,
     QUASI_OMNIDIRECTIONAL_WALKING_V2_TASK_ID,
     SE2_TRACKING_TASK_ID,
 }
+
+
+def commands_for_task(task_id: str) -> dict[str, tuple[float, float, float]]:
+    """Return only command modes that the selected task actually trains."""
+    if task_id == PERIODIC_REWARD_COMPOSITION_WALKING_TASK_ID:
+        return AXIS_EXCLUSIVE_COMMANDS
+    if task_id == NATURAL_OMNIDIRECTIONAL_V3_TASK_ID:
+        return V3_COMMANDS
+    if task_id in (NATURAL_OMNIDIRECTIONAL_V4_TASK_ID, NATURAL_OMNIDIRECTIONAL_V5_TASK_ID):
+        return V4_COMMANDS
+    return COMMANDS
 
 
 @dataclass(frozen=True)
@@ -538,6 +556,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int)
     parser.add_argument("--stride", type=int, default=50)
+    parser.add_argument(
+        "--forward-speed", type=float,
+        help="Override vx for forward and curve modes (useful for speed curricula).",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -564,15 +586,18 @@ def main() -> int:
         raise ValueError(f"{task_id!r} is not an omnidirectional evaluation task")
 
     replicas = args.replicas
-    mode_commands = (
-        AXIS_EXCLUSIVE_COMMANDS
-        if task_id == PERIODIC_REWARD_COMPOSITION_WALKING_TASK_ID
-        else V3_COMMANDS
-        if task_id == NATURAL_OMNIDIRECTIONAL_V3_TASK_ID
-        else COMMANDS
-    )
-    if task_id == NATURAL_OMNIDIRECTIONAL_V4_TASK_ID:
-        mode_commands = {name: value for name, value in COMMANDS.items() if name != 'backward'}
+    mode_commands = commands_for_task(task_id)
+    if args.forward_speed is not None:
+        if args.forward_speed <= 0.0:
+            raise ValueError("--forward-speed must be positive")
+        mode_commands = {
+            name: (
+                (args.forward_speed, command[1], command[2])
+                if name in ("forward", "curve_left", "curve_right")
+                else command
+            )
+            for name, command in mode_commands.items()
+        }
     commands = torch.tensor(list(mode_commands.values()), device=device).repeat_interleave(
         replicas, dim=0
     )
@@ -588,7 +613,8 @@ def main() -> int:
     objectives = (
         Objectives(maximum_linear_error_mps=.02, maximum_yaw_error_radps=.04,
                    maximum_path_rmse_m=.06, maximum_heading_rmse_rad=.12)
-        if task_id == NATURAL_OMNIDIRECTIONAL_V4_TASK_ID else Objectives()
+        if task_id in (NATURAL_OMNIDIRECTIONAL_V4_TASK_ID, NATURAL_OMNIDIRECTIONAL_V5_TASK_ID)
+        else Objectives()
     )
     evaluated = []
     try:

@@ -11,6 +11,16 @@ from mjlab.envs import mdp as env_mdp
 from mjlab.managers.event_manager import RecomputeLevel, requires_model_fields
 from mjlab.managers.manager_base import ManagerTermBase
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul
+
+from locomotion.servo import (
+    STS3215_MAX_PROFILE_ACCELERATION_RAD_S2,
+    STS3215_MAX_PROFILE_SPEED_RAD_S,
+    STS3215_POSITION_RESOLUTION_RAD,
+    STS3215_VELOCITY_FILTER_ALPHA,
+    quantize_position_torch,
+)
+from locomotion.imu import SimulatedIcm42688
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 _FOOT_SITES_CFG = SceneEntityCfg(
@@ -263,6 +273,26 @@ def mid_swing_active(
     return torch.any(swing & (progress >= 0.25) & (progress <= 0.75), dim=1)
 
 
+@requires_model_fields(
+    "geom_friction",
+    "geom_pos",
+    "geom_quat",
+    "geom_solref",
+    "geom_solimp",
+    "body_mass",
+    "body_ipos",
+    "body_inertia",
+    "body_iquat",
+    "actuator_gainprm",
+    "actuator_biasprm",
+    "actuator_forcerange",
+    "dof_damping",
+    "dof_frictionloss",
+    "dof_armature",
+    "jnt_actfrcrange",
+    "tendon_actfrcrange",
+    recompute=RecomputeLevel.set_const,
+)
 def full_domain_randomization(
     env,
     env_ids: torch.Tensor,
@@ -299,6 +329,9 @@ class Sts3215RandomizationPrior:
     unit_stiffness_factor: tuple[float, float] = (0.95, 1.05)
     friction_factor: tuple[float, float] = (0.75, 1.25)
     armature_factor: tuple[float, float] = (0.80, 1.25)
+    calibration_scale_factor: tuple[float, float] = (0.995, 1.005)
+    firmware_velocity_factor: tuple[float, float] = (0.95, 1.05)
+    firmware_acceleration_factor: tuple[float, float] = (0.80, 1.20)
     encoder_bias_rad: float = math.radians(1.0)
     backlash_total_rad: tuple[float, float] = (
         math.radians(0.5),
@@ -306,9 +339,162 @@ class Sts3215RandomizationPrior:
     )
     latency_lags: tuple[int, int] = (1, 3)
     encoder_noise_rad: float = math.radians(0.20)
+    position_resolution_rad: float = STS3215_POSITION_RESOLUTION_RAD
 
 
 STS3215_RANDOMIZATION = Sts3215RandomizationPrior()
+
+
+@dataclass(frozen=True)
+class FootGroundRandomizationPrior:
+    """Pre-hardware sole, pad, contact, and floor uncertainty."""
+
+    sole_roll_rad: float = math.radians(1.0)
+    sole_pitch_rad: float = math.radians(1.0)
+    sole_height_m: float = 0.0005
+    # MuJoCo's default refsafety rule requires timeconst >= 2 * physics_dt.
+    # At LeggyBot's 5 ms physics step, 10 ms is the smallest effective value.
+    contact_time_constant_s: tuple[float, float] = (0.010, 0.015)
+    contact_damping_ratio: tuple[float, float] = (0.7, 1.3)
+    compliance_width_m: tuple[float, float] = (0.0005, 0.002)
+    torsional_friction_factor: tuple[float, float] = (0.6, 1.4)
+    rolling_friction_factor: tuple[float, float] = (0.6, 1.4)
+    floor_roll_rad: float = math.radians(1.5)
+    floor_pitch_rad: float = math.radians(1.5)
+
+
+FOOT_GROUND_RANDOMIZATION = FootGroundRandomizationPrior()
+
+
+def _global_geom_ids(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Resolve an entity-local geom selection to MuJoCo global geom IDs."""
+    asset_cfg.resolve(env.scene)
+    entity_ids = env.scene[asset_cfg.name].indexing.geom_ids
+    local_ids = asset_cfg.geom_ids
+    if isinstance(local_ids, slice):
+        return entity_ids[local_ids].to(device=env.device, dtype=torch.long)
+    return entity_ids[torch.as_tensor(local_ids, device=env.device)].long()
+
+
+def _scaled_uniform(
+    env,
+    shape: tuple[int, ...],
+    value_range: tuple[float, float],
+    nominal: float,
+) -> torch.Tensor:
+    raw = torch.empty(shape, device=env.device).uniform_(*value_range)
+    scale = sim2real_randomization_scale(env)
+    return nominal + scale * (raw - nominal)
+
+
+def _randomize_foot_ground(
+    env,
+    env_ids: torch.Tensor,
+    *,
+    paired_geometry: bool,
+) -> None:
+    """Randomize collision-only soles, compliant contact, and floor slope.
+
+    Material/contact properties are global per robot because both pads are cut
+    from the same sheet. Sole mounting errors are mirrored during the symmetry
+    phase and independent during full domain randomization.
+    """
+    prior = FOOT_GROUND_RANDOMIZATION
+    scale = sim2real_randomization_scale(env)
+    selected = torch.arange(env.num_envs, device=env.device)[env_ids].long()
+    batch = len(selected)
+    feet_cfg = SceneEntityCfg(
+        "robot",
+        geom_names=("right_foot_collision", "left_foot_collision"),
+        preserve_order=True,
+    )
+    terrain_cfg = SceneEntityCfg(
+        "terrain", geom_names=("terrain",), preserve_order=True
+    )
+    foot_ids = _global_geom_ids(env, feet_cfg)
+    terrain_ids = _global_geom_ids(env, terrain_cfg)
+    if len(foot_ids) != 2 or len(terrain_ids) != 1:
+        raise ValueError("expected two foot collision geoms and one terrain plane")
+
+    def centered(maximum: float, shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.empty(shape, device=env.device).uniform_(
+            -maximum * scale, maximum * scale
+        )
+
+    if paired_geometry:
+        # In each foot's local frame, X is lateral, Y is forward, and Z is the
+        # sole normal. A sagittal reflection preserves pitch/height and flips
+        # roll. quat_from_euler_xyz therefore receives equal local-X rotations
+        # and opposite local-Y rotations for the two feet.
+        sole_pitch = centered(prior.sole_pitch_rad, (batch, 1))
+        sole_roll = centered(prior.sole_roll_rad, (batch, 1))
+        local_x = torch.cat((-sole_pitch, -sole_pitch), dim=1)
+        local_y = torch.cat((sole_roll, -sole_roll), dim=1)
+        height = centered(prior.sole_height_m, (batch, 1)).expand(-1, 2)
+    else:
+        local_x = -centered(prior.sole_pitch_rad, (batch, 2))
+        local_y = centered(prior.sole_roll_rad, (batch, 2))
+        height = centered(prior.sole_height_m, (batch, 2))
+
+    zeros = torch.zeros_like(local_x)
+    perturbation = quat_from_euler_xyz(
+        local_x.flatten(), local_y.flatten(), zeros.flatten()
+    ).reshape(batch, 2, 4)
+    default_quat = env.sim.get_default_field("geom_quat")[foot_ids]
+    default_quat = default_quat.unsqueeze(0).expand(batch, -1, -1).contiguous()
+    # Post-multiply so roll/pitch are expressed in the nominal sole frame.
+    # This is equivalent for today's identity foot-geom quaternions, but also
+    # remains correct if the CAD export later gives either geom a local pose.
+    foot_quat = quat_mul(default_quat, perturbation)
+    env_grid, foot_grid = torch.meshgrid(selected, foot_ids, indexing="ij")
+    model = env.sim.model
+    model.geom_quat[env_grid, foot_grid] = foot_quat
+    default_pos = env.sim.get_default_field("geom_pos")[foot_ids]
+    model.geom_pos[env_grid, foot_grid] = default_pos.unsqueeze(0)
+    model.geom_pos[env_grid, foot_grid, 2] += height
+
+    # Both pads share one material realization. The positive solref format is
+    # (time constant, damping ratio); solimp width approximates the finite
+    # compression distance of a thin silicone/polyurethane pad.
+    time_constant = _scaled_uniform(
+        env, (batch, 1), prior.contact_time_constant_s, 0.010
+    )
+    damping_ratio = _scaled_uniform(
+        env, (batch, 1), prior.contact_damping_ratio, 1.0
+    )
+    compliance_width = _scaled_uniform(
+        env, (batch, 1), prior.compliance_width_m, 0.001
+    )
+    model.geom_solref[env_grid, foot_grid, 0] = time_constant.expand(-1, 2)
+    model.geom_solref[env_grid, foot_grid, 1] = damping_ratio.expand(-1, 2)
+    default_solimp = env.sim.get_default_field("geom_solimp")[foot_ids]
+    model.geom_solimp[env_grid, foot_grid] = default_solimp.unsqueeze(0)
+    model.geom_solimp[env_grid, foot_grid, 2] = compliance_width.expand(-1, 2)
+
+    tangential = _scaled_uniform(env, (batch, 1), (0.5, 1.2), 0.9)
+    torsion_factor = _scaled_uniform(
+        env, (batch, 1), prior.torsional_friction_factor, 1.0
+    )
+    rolling_factor = _scaled_uniform(
+        env, (batch, 1), prior.rolling_friction_factor, 1.0
+    )
+    default_friction = env.sim.get_default_field("geom_friction")[foot_ids]
+    model.geom_friction[env_grid, foot_grid] = default_friction.unsqueeze(0)
+    model.geom_friction[env_grid, foot_grid, 0] = tangential.expand(-1, 2)
+    model.geom_friction[env_grid, foot_grid, 1] *= torsion_factor.expand(-1, 2)
+    model.geom_friction[env_grid, foot_grid, 2] *= rolling_factor.expand(-1, 2)
+
+    floor_roll = centered(prior.floor_roll_rad, (batch, 1))
+    floor_pitch = centered(prior.floor_pitch_rad, (batch, 1))
+    floor_perturbation = quat_from_euler_xyz(
+        floor_roll.flatten(), floor_pitch.flatten(), torch.zeros(batch, device=env.device)
+    ).reshape(batch, 1, 4)
+    default_floor_quat = env.sim.get_default_field("geom_quat")[terrain_ids]
+    default_floor_quat = default_floor_quat.unsqueeze(0).expand(batch, -1, -1).contiguous()
+    floor_quat = quat_mul(floor_perturbation, default_floor_quat)
+    terrain_grid = terrain_ids.unsqueeze(0).expand(batch, -1)
+    selected_grid = selected.unsqueeze(1).expand_as(terrain_grid)
+    model.geom_quat[selected_grid, terrain_grid] = floor_quat
 
 
 def _single_actuator(env, name: str):
@@ -353,14 +539,12 @@ def _randomize_sts3215_servos(
     defaults = env.sim.get_default_field
 
     ctrl_ids = []
-    actuators = []
     for actuator_name in (
         "right_hip_roll", "right_thigh", "right_knee",
         "left_hip_roll", "left_thigh", "left_knee",
     ):
         _, actuator = _single_actuator(env, actuator_name)
         ctrl_ids.append(int(torch.as_tensor(actuator.global_ctrl_ids).reshape(-1)[0]))
-        actuators.append(actuator)
     ctrl_ids = torch.tensor(ctrl_ids, device=env.device, dtype=torch.long)
 
     local_joint_ids, _ = env.scene["robot"].find_joints(
@@ -432,21 +616,46 @@ def _randomize_sts3215_servos(
         bias = torch.empty((batch, n), device=env.device).uniform_(
             -bias_half_range, bias_half_range
         )
-    env.scene["robot"].data.encoder_bias[selected[:, None], local_joint_ids] = bias
+    calibration_scale = samples(prior.calibration_scale_factor)
+    firmware_velocity = samples(prior.firmware_velocity_factor)
+    firmware_acceleration = samples(prior.firmware_acceleration_factor)
 
     backlash_total = _paired_or_independent_samples(
         env, batch, n, prior.backlash_total_rad, paired
     ) * scale
     action = env.action_manager.get_term("joint_pos")
     action_width = torch.zeros((batch, action.action_dim), device=env.device)
+    action_bias = torch.zeros_like(action_width)
+    action_scale = torch.ones_like(action_width)
+    action_profile_velocity = torch.zeros_like(action_width)
+    action_profile_acceleration = torch.zeros_like(action_width)
     action_name_to_id = {name: i for i, name in enumerate(action.target_names)}
     for source, name in enumerate(_STS3215_JOINT_NAMES):
-        action_width[:, action_name_to_id[name]] = 0.5 * backlash_total[:, source]
+        target = action_name_to_id[name]
+        action_width[:, target] = 0.5 * backlash_total[:, source]
+        action_bias[:, target] = bias[:, source]
+        action_scale[:, target] = calibration_scale[:, source]
+        # Register limits live in the software/count coordinate. Convert them
+        # through the same calibration scale before applying the physical
+        # setpoint profile.
+        action_profile_velocity[:, target] = (
+            STS3215_MAX_PROFILE_SPEED_RAD_S
+            * firmware_velocity[:, source]
+            / calibration_scale[:, source]
+        )
+        action_profile_acceleration[:, target] = (
+            STS3215_MAX_PROFILE_ACCELERATION_RAD_S2
+            * firmware_acceleration[:, source]
+            / calibration_scale[:, source]
+        )
     action.set_backlash_half_width(action_width, selected)
+    action.set_servo_calibration(action_bias, action_scale, selected)
+    action.set_firmware_profile_limits(
+        action_profile_velocity, action_profile_acceleration, selected
+    )
 
-    # The bus delay is common to all servos in one robot. XmlActuator instances
-    # own separate buffers, so assign the same per-environment lag to each and
-    # keep it fixed for the episode (delay_hold_prob=1 in the robot config).
+    # The bus delay is common to all servos in one synchronized packet. The
+    # action term owns one FIFO per robot and adds correlated packet jitter.
     if randomize_latency:
         if scale <= 0.0:
             lags = torch.zeros(batch, device=env.device, dtype=torch.long)
@@ -456,10 +665,29 @@ def _randomize_sts3215_servos(
             lags = torch.randint(
                 lag_min, lag_max + 1, (batch,), device=env.device
             )
-        for actuator in actuators:
-            actuator.set_lags(lags, selected)
+        action.set_command_delay(lags, scale, selected)
 
 
+@requires_model_fields(
+    "geom_friction",
+    "geom_pos",
+    "geom_quat",
+    "geom_solref",
+    "geom_solimp",
+    "body_mass",
+    "body_ipos",
+    "body_inertia",
+    "body_iquat",
+    "actuator_gainprm",
+    "actuator_biasprm",
+    "actuator_forcerange",
+    "dof_damping",
+    "dof_frictionloss",
+    "dof_armature",
+    "jnt_actfrcrange",
+    "tendon_actfrcrange",
+    recompute=RecomputeLevel.set_const,
+)
 def symmetric_domain_randomization(env, env_ids: torch.Tensor) -> None:
     """Pair servo variation without introducing independent leg-inertia mismatch.
 
@@ -471,23 +699,12 @@ def symmetric_domain_randomization(env, env_ids: torch.Tensor) -> None:
     """
     scale = sim2real_randomization_scale(env)
     robot = SceneEntityCfg("robot")
-    feet = SceneEntityCfg(
-        "robot", geom_names=("right_foot_collision", "left_foot_collision"), preserve_order=True
-    )
     robot.resolve(env.scene)
-    feet.resolve(env.scene)
 
-    # One terrain/friction realization per environment already preserves the
-    # reflection. Torso perturbations retain the nominal lateral COM and
-    # central-inertia axes; small existing CAD asymmetries are not removed.
-    env_mdp.dr.geom_friction(
-        env,
-        env_ids,
-        ranges=(0.9 - 0.4 * scale, 0.9 + 0.3 * scale),
-        operation="abs",
-        shared_random=True,
-        asset_cfg=feet,
-    )
+    # Shared pad/contact samples preserve bilateral material properties.
+    # Collision-only mounting errors remain mirrored until independent
+    # mismatch is enabled; the small global floor slope is active throughout.
+    _randomize_foot_ground(env, env_ids, paired_geometry=True)
     # Reset every robot inertia before constructing the paired endpoint. A
     # previous full/randomized episode must not leak leg mismatch into it.
     body_ids = env.scene["robot"].indexing.body_ids
@@ -527,8 +744,8 @@ def _interpolated_full_domain_randomization(
     # Only the current XML position-actuator fields are changed by full DR.
     # In particular, do not wrap an empty tendon vec2 array on CPU.
     field_names = (
-        "geom_friction", "actuator_gainprm", "actuator_biasprm",
-        "actuator_forcerange", "dof_damping", "dof_frictionloss", "dof_armature",
+        "actuator_gainprm", "actuator_biasprm", "actuator_forcerange",
+        "dof_damping", "dof_frictionloss", "dof_armature",
     )
     body_fields = ("body_mass", "body_ipos", "body_inertia", "body_iquat")
     body_ids = env.scene["robot"].indexing.body_ids
@@ -538,8 +755,25 @@ def _interpolated_full_domain_randomization(
     encoder_bias = env.scene["robot"].data.encoder_bias
     paired_encoder_bias = encoder_bias[env_ids].clone()
     action = env.action_manager.get_term("joint_pos")
+    paired_encoder_scale = action._entity.data.encoder_scale[env_ids].clone()
     paired_backlash = action._backlash_half_width[env_ids].clone()
+    paired_profile_velocity = action._firmware_max_velocity[env_ids].clone()
+    paired_profile_acceleration = action._firmware_max_acceleration[env_ids].clone()
+    foot_ids = _global_geom_ids(
+        env,
+        SceneEntityCfg(
+            "robot",
+            geom_names=("right_foot_collision", "left_foot_collision"),
+            preserve_order=True,
+        ),
+    )
+    selected = torch.arange(env.num_envs, device=env.device)[env_ids].long()
+    env_grid, foot_grid = torch.meshgrid(selected, foot_ids, indexing="ij")
+    paired_foot_pos = model.geom_pos[env_grid, foot_grid].clone()
+    paired_foot_quat = model.geom_quat[env_grid, foot_grid].clone()
     full_domain_randomization(env, env_ids, randomize_latency=False)
+    full_foot_pos = model.geom_pos[env_grid, foot_grid].clone()
+    full_foot_quat = model.geom_quat[env_grid, foot_grid].clone()
     for name in field_names:
         values = getattr(model, name)
         full_values = values[env_ids]
@@ -547,6 +781,21 @@ def _interpolated_full_domain_randomization(
             full_values - paired_fields[name]
         )
         values[env_ids] = blended
+    model.geom_pos[env_grid, foot_grid] = paired_foot_pos + amplitude * (
+        full_foot_pos - paired_foot_pos
+    )
+    # Normalized shortest-path interpolation is stable for this small (1 deg)
+    # mismatch range and keeps every per-world geom quaternion valid.
+    same_hemisphere = torch.sum(paired_foot_quat * full_foot_quat, dim=-1) >= 0.0
+    full_foot_quat = torch.where(
+        same_hemisphere[..., None], full_foot_quat, -full_foot_quat
+    )
+    blended_foot_quat = paired_foot_quat + amplitude * (
+        full_foot_quat - paired_foot_quat
+    )
+    model.geom_quat[env_grid, foot_grid] = torch.nn.functional.normalize(
+        blended_foot_quat, dim=-1
+    )
     # Interpolate physical mass distributions, independent of eigenvector
     # ordering or quaternion sign. Float64 avoids cancellation at CAD origins.
     from mjlab.envs.mdp.dr.body import _reconstruct_pseudo_inertia_J, _decompose_pseudo_inertia_J
@@ -560,14 +809,32 @@ def _interpolated_full_domain_randomization(
     encoder_bias[env_ids] = paired_encoder_bias + amplitude * (
         full_encoder_bias - paired_encoder_bias
     )
+    encoder_scale = action._entity.data.encoder_scale
+    full_encoder_scale = encoder_scale[env_ids].clone()
+    encoder_scale[env_ids] = paired_encoder_scale + amplitude * (
+        full_encoder_scale - paired_encoder_scale
+    )
     full_backlash = action._backlash_half_width[env_ids]
     action._backlash_half_width[env_ids] = paired_backlash + amplitude * (
         full_backlash - paired_backlash
+    )
+    full_profile_velocity = action._firmware_max_velocity[env_ids].clone()
+    action._firmware_max_velocity[env_ids] = paired_profile_velocity + amplitude * (
+        full_profile_velocity - paired_profile_velocity
+    )
+    full_profile_acceleration = action._firmware_max_acceleration[env_ids].clone()
+    action._firmware_max_acceleration[env_ids] = (
+        paired_profile_acceleration
+        + amplitude * (full_profile_acceleration - paired_profile_acceleration)
     )
 
 
 @requires_model_fields(
     "geom_friction",
+    "geom_pos",
+    "geom_quat",
+    "geom_solref",
+    "geom_solimp",
     "body_mass",
     "body_ipos",
     "body_inertia",
@@ -594,7 +861,8 @@ def updated_default_domain_randomization(
     ``independent_ramp_steps`` is zero.  Tasks that need a stable symmetric
     gait first can request a gradual full-domain transition instead. During the
     ramp, continuous simulator fields are interpolated between paired and full
-    realizations; discrete latency uses an increasing independent fraction.
+    realizations. Packet latency stays fully randomized because one synchronized
+    command packet supplies all six servos and has no left/right mismatch.
     """
     if symmetric_steps < 0:
         raise ValueError("symmetric randomization steps must be non-negative")
@@ -1485,8 +1753,6 @@ class StagedQuasiOmnidirectionalCurriculum:
         ids = self._ids(env, env_ids)
         self._collect_window(env, ids)
         while self._window_count >= self.window_episodes:
-            # Use the first complete window; any surplus episodes remain for the
-            # next evaluation window rather than causing multiple jumps.
             passed = self._window_passes()
             self._last_gate = passed
             if passed:
@@ -1523,6 +1789,124 @@ class StagedQuasiOmnidirectionalCurriculum:
         self.restore_checkpoint_requested = bool(
             state.get("restore_checkpoint_requested", False)
         )
+
+
+class ForwardSpeedGateCurriculum:
+    """Unlock higher forward speeds after sustained tracking succeeds.
+
+    The term is evaluated at episode resets, before episode metrics are
+    cleared.  Completed-episode tracking means are retained over a rolling
+    PPO-iteration window.  A gate can advance only after both the window mean
+    passes and the current speed has been active for the minimum dwell time.
+    """
+
+    def __init__(
+        self,
+        speed_levels: tuple[float, ...] = (
+            0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
+        ),
+        success_threshold: float = 0.70,
+        success_window_iterations: int = 50,
+        minimum_gate_iterations: int = 100,
+        steps_per_iteration: int = 24,
+        minimum_forward_speed: float = 0.04,
+        metric_name: str = "tracking_success",
+    ) -> None:
+        if not speed_levels or any(speed <= 0.0 for speed in speed_levels):
+            raise ValueError("speed levels must be positive")
+        if any(b <= a for a, b in zip(speed_levels, speed_levels[1:])):
+            raise ValueError("speed levels must be strictly increasing")
+        if not 0.0 <= success_threshold <= 1.0:
+            raise ValueError("success threshold must be in [0, 1]")
+        if min(success_window_iterations, minimum_gate_iterations, steps_per_iteration) <= 0:
+            raise ValueError("curriculum iteration parameters must be positive")
+        if not 0.0 <= minimum_forward_speed <= speed_levels[0]:
+            raise ValueError("minimum forward speed must fit the first gate")
+        self.speed_levels = tuple(float(speed) for speed in speed_levels)
+        self.success_threshold = float(success_threshold)
+        self.success_window_iterations = int(success_window_iterations)
+        self.minimum_gate_iterations = int(minimum_gate_iterations)
+        self.steps_per_iteration = int(steps_per_iteration)
+        self.minimum_forward_speed = float(minimum_forward_speed)
+        self.metric_name = metric_name
+        self.level = 0
+        self.gate_start_iteration = 0
+        self._history: list[tuple[int, float, int]] = []
+
+    @staticmethod
+    def _ids(env, env_ids) -> torch.Tensor:
+        if env_ids is None or isinstance(env_ids, slice):
+            return torch.arange(env.num_envs, device=env.device)
+        return env_ids
+
+    def _iteration(self, env) -> int:
+        return int(getattr(env, "common_step_counter", 0)) // self.steps_per_iteration
+
+    def _collect(self, env, env_ids, iteration: int) -> None:
+        ids = self._ids(env, env_ids)
+        manager = getattr(env, "metrics_manager", None)
+        sums = getattr(manager, "_episode_sums", {}).get(self.metric_name)
+        counts = getattr(manager, "_step_count", None)
+        if sums is None or counts is None or len(ids) == 0:
+            return
+        valid = counts[ids] > 0
+        if not torch.any(valid):
+            return
+        ids = ids[valid]
+        values = sums[ids] / torch.clamp(counts[ids].float(), min=1.0)
+        self._history.append((iteration, float(values.sum().item()), len(ids)))
+        first = iteration - self.success_window_iterations
+        self._history = [sample for sample in self._history if sample[0] > first]
+
+    def _window_mean(self) -> float:
+        count = sum(sample[2] for sample in self._history)
+        if count == 0:
+            return 0.0
+        return sum(sample[1] for sample in self._history) / count
+
+    def _apply(self, env, iteration: int) -> dict[str, float]:
+        maximum = self.speed_levels[self.level]
+        command = env.command_manager.get_term("twist").cfg
+        command.ranges.lin_vel_x = (0.0, maximum)
+        command.protected_forward_range = (self.minimum_forward_speed, maximum)
+        return {
+            "forward_speed_gate": float(self.level),
+            "forward_speed_max_mps": maximum,
+            "gate_age_iterations": float(iteration - self.gate_start_iteration),
+            "gate_tracking_success": self._window_mean(),
+        }
+
+    def __call__(self, env, env_ids=None) -> dict[str, float]:
+        iteration = self._iteration(env)
+        self._collect(env, env_ids, iteration)
+        gate_age = iteration - self.gate_start_iteration
+        if (
+            self.level + 1 < len(self.speed_levels)
+            and gate_age >= self.minimum_gate_iterations
+            and self._window_mean() >= self.success_threshold
+        ):
+            self.level += 1
+            self.gate_start_iteration = iteration
+            self._history.clear()
+        return self._apply(env, iteration)
+
+    def state_dict(self) -> dict:
+        return {
+            "level": self.level,
+            "gate_start_iteration": self.gate_start_iteration,
+            "history": list(self._history),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        level = int(state.get("level", 0))
+        if not 0 <= level < len(self.speed_levels):
+            raise ValueError("saved forward-speed gate is out of range")
+        self.level = level
+        self.gate_start_iteration = int(state.get("gate_start_iteration", 0))
+        self._history = [
+            (int(iteration), float(total), int(count))
+            for iteration, total, count in state.get("history", [])
+        ]
 
 
 class _CommandedCycleMotionTerm(ManagerTermBase):
@@ -3657,6 +4041,10 @@ def sim2real_randomization_scale(env) -> float:
 
 @requires_model_fields(
     "geom_friction",
+    "geom_pos",
+    "geom_quat",
+    "geom_solref",
+    "geom_solimp",
     "body_mass",
     "body_ipos",
     "body_inertia",
@@ -3679,20 +4067,9 @@ def sim2real_domain_randomization(
     """Apply a task-configured reset randomization envelope."""
     scale = sim2real_randomization_scale(env)
     robot = SceneEntityCfg("robot")
-    feet = SceneEntityCfg(
-        "robot", geom_names=("right_foot_collision", "left_foot_collision")
-    )
-    for asset_cfg in (robot, feet):
-        asset_cfg.resolve(env.scene)
+    robot.resolve(env.scene)
 
-    env_mdp.dr.geom_friction(
-        env,
-        env_ids,
-        ranges=(0.9 - 0.4 * scale, 0.9 + 0.3 * scale),
-        operation="abs",
-        shared_random=True,
-        asset_cfg=feet,
-    )
+    _randomize_foot_ground(env, env_ids, paired_geometry=False)
     env_mdp.dr.pseudo_inertia(
         env,
         env_ids,
@@ -3712,23 +4089,307 @@ def _scaled_noise(env, value: torch.Tensor, maximum: float) -> torch.Tensor:
     return value + (2.0 * torch.rand_like(value) - 1.0) * maximum * scale
 
 
+def _calibrated_joint_position(robot) -> torch.Tensor:
+    """Map physical joint angle into the controller's software coordinate."""
+    bias = getattr(robot.data, "encoder_bias", None)
+    if bias is None:
+        # Lightweight unit-test and third-party entities may not expose mjlab's
+        # optional encoder fields.
+        bias = torch.zeros_like(robot.data.joint_pos)
+    scale = getattr(robot.data, "encoder_scale", None)
+    if scale is None:
+        scale = torch.ones_like(bias)
+    return robot.data.joint_pos * scale + bias
+
+
+def _simulated_imu(env) -> SimulatedIcm42688:
+    estimator = getattr(env, "_simulated_icm42688", None)
+    if estimator is None:
+        estimator = SimulatedIcm42688(env.num_envs, env.device)
+        env._simulated_icm42688 = estimator
+    return estimator
+
+
+def _simulated_imu_outputs(
+    env, gyro_sensor_name: str, accel_sensor_name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    estimator = _simulated_imu(env)
+    return estimator.update(
+        env_mdp.builtin_sensor(env, gyro_sensor_name),
+        env_mdp.builtin_sensor(env, accel_sensor_name),
+        env.episode_length_buf,
+        sim2real_randomization_scale(env),
+    )
+
+
+class Sim2RealImuAngularVelocity(ManagerTermBase):
+    def __init__(self, cfg, env) -> None:
+        del cfg
+        super().__init__(env)
+        self._imu = _simulated_imu(env)
+
+    def reset(self, env_ids=None) -> None:
+        self._imu.reset(env_ids)
+
+    def __call__(self, env, gyro_sensor_name: str, accel_sensor_name: str):
+        return _simulated_imu_outputs(
+            env, gyro_sensor_name, accel_sensor_name
+        )[0]
+
+
+class Sim2RealImuProjectedGravity(ManagerTermBase):
+    def __init__(self, cfg, env) -> None:
+        del cfg
+        super().__init__(env)
+        self._imu = _simulated_imu(env)
+
+    def reset(self, env_ids=None) -> None:
+        self._imu.reset(env_ids)
+
+    def __call__(self, env, gyro_sensor_name: str, accel_sensor_name: str):
+        return _simulated_imu_outputs(
+            env, gyro_sensor_name, accel_sensor_name
+        )[1]
+
+
 def sim2real_base_ang_vel(env, sensor_name: str, maximum_noise: float = 0.2):
+    """Legacy archived-run observation; new tasks use the ICM estimator."""
     return _scaled_noise(
         env, env_mdp.builtin_sensor(env, sensor_name), maximum_noise
     )
 
 
 def sim2real_projected_gravity(env, maximum_noise: float = 0.05):
+    """Legacy archived-run observation; new tasks use the ICM estimator."""
     return _scaled_noise(env, env_mdp.projected_gravity(env), maximum_noise)
 
 
 def sim2real_joint_pos(
     env, maximum_noise: float = STS3215_RANDOMIZATION.encoder_noise_rad
 ):
-    return _scaled_noise(
-        env, env_mdp.joint_pos_rel(env, biased=True), maximum_noise
+    robot = env.scene["robot"]
+    measured = _scaled_noise(env, _calibrated_joint_position(robot), maximum_noise)
+    # MuJoCo remains continuous. Only the feedback presented to the actor is
+    # reduced to the STS3215's 12-bit position resolution. Quantizing the
+    # absolute joint coordinate before subtracting the policy's nominal pose
+    # matches the deployment observation path for a nonzero nominal pose.
+    observed = quantize_position_torch(
+        measured, STS3215_RANDOMIZATION.position_resolution_rad
     )
+    # The following joint-velocity term must differentiate this exact sensor
+    # sample, including its noise and count quantization.  Keep the sample on
+    # the environment for the duration of this observation-manager pass.
+    env._sim2real_joint_position_sample = observed
+    env._sim2real_joint_position_sample_step = env.episode_length_buf.clone()
+    return observed - robot.data.default_joint_pos
 
 
-def sim2real_joint_vel(env, maximum_noise: float = 1.5):
-    return _scaled_noise(env, env_mdp.joint_vel_rel(env), maximum_noise)
+class _ServoObservationAge:
+    """Keep position and derived velocity on one randomized servo-bus age."""
+
+    def __init__(self, env) -> None:
+        shape = env.scene["robot"].data.joint_pos.shape
+        self.device = env.device
+        self.previous_position = torch.zeros(shape, device=self.device)
+        self.previous_velocity = torch.zeros(shape, device=self.device)
+        self.output_position = torch.zeros(shape, device=self.device)
+        self.output_velocity = torch.zeros(shape, device=self.device)
+        self.current_position = torch.zeros(shape, device=self.device)
+        self.lag = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
+        self.last_step = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=self.device
+        )
+        self.pending_step = torch.full_like(self.last_step, -1)
+        self.pending_fresh = torch.zeros_like(self.lag)
+
+    def reset(self, env_ids=None) -> None:
+        ids = slice(None) if env_ids is None else env_ids
+        self.last_step[ids] = -1
+        self.pending_step[ids] = -1
+        self.previous_velocity[ids] = 0.0
+        self.output_velocity[ids] = 0.0
+
+    def begin(
+        self, position: torch.Tensor, step: torch.Tensor, strength: float
+    ) -> torch.Tensor:
+        update = step != self.last_step
+        already_pending = step == self.pending_step
+        update &= ~already_pending
+        fresh = update & ((self.last_step < 0) | (step < self.last_step))
+        continuing = update & ~fresh
+        ids = torch.where(update)[0]
+        if ids.numel():
+            if torch.any(fresh):
+                fresh_ids = torch.where(fresh)[0]
+                self.lag[fresh_ids] = (
+                    torch.rand(fresh_ids.numel(), device=self.device)
+                    < 0.5 * float(strength)
+                )
+            if torch.any(continuing):
+                continuing_ids = torch.where(continuing)[0]
+                change = torch.rand(
+                    continuing_ids.numel(), device=self.device
+                ) > 0.9
+                if torch.any(change):
+                    changed_ids = continuing_ids[change]
+                    self.lag[changed_ids] = (
+                        torch.rand(changed_ids.numel(), device=self.device)
+                        < 0.5 * float(strength)
+                    )
+            use_previous = self.lag[ids] & ~fresh[ids]
+            self.current_position[ids] = position[ids]
+            self.output_position[ids] = torch.where(
+                use_previous[:, None], self.previous_position[ids], position[ids]
+            )
+            self.pending_step[ids] = step[ids]
+            self.pending_fresh[ids] = fresh[ids]
+        return self.output_position
+
+    def finish(self, velocity: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+        update = (self.pending_step == step) & (self.last_step != step)
+        ids = torch.where(update)[0]
+        if ids.numel():
+            use_previous = self.lag[ids] & ~self.pending_fresh[ids]
+            self.output_velocity[ids] = torch.where(
+                use_previous[:, None], self.previous_velocity[ids], velocity[ids]
+            )
+            self.previous_position[ids] = self.current_position[ids]
+            self.previous_velocity[ids] = velocity[ids]
+            self.last_step[ids] = step[ids]
+        return self.output_velocity
+
+
+def _servo_observation_age(env) -> _ServoObservationAge:
+    age = getattr(env, "_servo_observation_age", None)
+    if age is None:
+        age = _ServoObservationAge(env)
+        env._servo_observation_age = age
+    return age
+
+
+class Sim2RealJointPosition(ManagerTermBase):
+    def __init__(self, cfg, env) -> None:
+        del cfg
+        super().__init__(env)
+        self._age = _servo_observation_age(env)
+
+    def reset(self, env_ids=None) -> None:
+        self._age.reset(env_ids)
+
+    def __call__(
+        self,
+        env,
+        maximum_noise: float = STS3215_RANDOMIZATION.encoder_noise_rad,
+    ) -> torch.Tensor:
+        robot = env.scene["robot"]
+        measured = _scaled_noise(
+            env, _calibrated_joint_position(robot), maximum_noise
+        )
+        observed = quantize_position_torch(
+            measured, STS3215_RANDOMIZATION.position_resolution_rad
+        )
+        env._sim2real_joint_position_sample = observed
+        env._sim2real_joint_position_sample_step = env.episode_length_buf.clone()
+        delayed = self._age.begin(
+            observed,
+            env.episode_length_buf,
+            sim2real_randomization_scale(env),
+        )
+        return delayed - robot.data.default_joint_pos
+
+
+class Sim2RealJointVelocity(ManagerTermBase):
+    """Estimate velocity from noisy, quantized 50 Hz position observations.
+
+    This replaces access to MuJoCo's exact generalized velocity with the same
+    causal backward difference and low-pass filter used by deployment.  The
+    cached output also makes the term safe if an observation group is computed
+    more than once during one environment step.
+    """
+
+    def __init__(self, cfg, env) -> None:
+        super().__init__(env)
+        self._filter_alpha = float(
+            cfg.params.get("filter_alpha", STS3215_VELOCITY_FILTER_ALPHA)
+        )
+        if not 0.0 < self._filter_alpha <= 1.0:
+            raise ValueError("joint velocity filter alpha must be in (0, 1]")
+        shape = (self.num_envs, env.scene["robot"].data.joint_pos.shape[1])
+        self._previous_position = torch.zeros(shape, device=self.device)
+        self._filtered_velocity = torch.zeros_like(self._previous_position)
+        self._cached = torch.zeros_like(self._previous_position)
+        self._last_step = torch.full(
+            (self.num_envs,), -1, dtype=torch.long, device=self.device
+        )
+        self._age = _servo_observation_age(env)
+
+    def reset(self, env_ids: torch.Tensor | slice | None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        self._last_step[env_ids] = -1
+        self._previous_position[env_ids] = 0.0
+        self._filtered_velocity[env_ids] = 0.0
+        self._cached[env_ids] = 0.0
+        self._age.reset(env_ids)
+
+    def __call__(
+        self,
+        env,
+        maximum_noise: float = STS3215_RANDOMIZATION.encoder_noise_rad,
+        filter_alpha: float = STS3215_VELOCITY_FILTER_ALPHA,
+    ) -> torch.Tensor:
+        # Manager parameters are also supplied to __call__. Reject a mismatch
+        # rather than silently using different filters during initialization
+        # and evaluation.
+        if filter_alpha != self._filter_alpha:
+            raise ValueError("joint velocity filter alpha changed after initialization")
+        robot = env.scene["robot"]
+        step = env.episode_length_buf
+        sampled = getattr(env, "_sim2real_joint_position_sample", None)
+        sampled_step = getattr(env, "_sim2real_joint_position_sample_step", None)
+        if (
+            sampled is not None
+            and sampled_step is not None
+            and torch.equal(sampled_step, step)
+        ):
+            observed = sampled
+        else:
+            # This fallback keeps the term usable in isolation. During normal
+            # actor observation construction, joint_pos precedes joint_vel and
+            # supplies the shared sample above.
+            measured = _scaled_noise(
+                env, _calibrated_joint_position(robot), maximum_noise
+            )
+            observed = quantize_position_torch(
+                measured, STS3215_RANDOMIZATION.position_resolution_rad
+            )
+        # Normally the joint-position term has already opened this coherent
+        # device sample. The call is idempotent and also supports isolated
+        # velocity-term tests or custom observation ordering.
+        self._age.begin(
+            observed, step, sim2real_randomization_scale(env)
+        )
+        update = step != self._last_step
+        fresh = update & ((self._last_step < 0) | (step < self._last_step))
+        continuing = update & ~fresh
+
+        if torch.any(fresh):
+            self._previous_position[fresh] = observed[fresh]
+            self._filtered_velocity[fresh] = 0.0
+            self._cached[fresh] = 0.0
+        if torch.any(continuing):
+            raw = (
+                observed[continuing] - self._previous_position[continuing]
+            ) / env.step_dt
+            self._filtered_velocity[continuing] += self._filter_alpha * (
+                raw - self._filtered_velocity[continuing]
+            )
+            self._previous_position[continuing] = observed[continuing]
+            self._cached[continuing] = self._filtered_velocity[continuing]
+        self._last_step[update] = step[update]
+        return self._age.finish(self._cached, step)
+
+
+# Keep archived environment YAML files importable.  New configurations resolve
+# this name to the stateful estimator rather than the former exact-qvel helper.
+sim2real_joint_vel = Sim2RealJointVelocity

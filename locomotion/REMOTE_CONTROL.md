@@ -88,20 +88,101 @@ for it while newer control data exists. On separate machines, synchronize clocks
 with PTP when measured end-to-end latency or multi-sensor fusion depends on a
 common clock. Never estimate latency by subtracting unsynchronized timestamps.
 
+## Servo calibration and command timing
+
+Policy position targets and servo feedback are software joint coordinates. The
+hardware bridge must own one calibration per joint and use it in both paths:
+
+```text
+reported_angle = scale * physical_angle + zero_offset
+physical_target = (quantized_software_target - zero_offset) / scale
+```
+
+For an STS3215 bridge, perform target quantization in servo-count space before
+the inverse mapping, and convert feedback counts through the forward mapping
+before publishing `joint_position`. A horn/zero error can therefore change the
+physical pose even while target and feedback counts agree. Do not add a second
+observation-only offset in the policy controller.
+
+Training models the six-servo synchronous write as one ordered command FIFO.
+At the 200 Hz physics rate its base latency is 5--15 ms, packet jitter is
+correlated and usually within 5 ms, and rare commands arrive one additional
+20 ms policy frame late. The hardware bridge should timestamp command receipt
+and actuator application when possible; these provisional ranges should be
+replaced with measured bus/controller timing without changing the policy API.
+
+## STS3215 firmware position profile
+
+The hardware daemon must configure every servo explicitly at startup. Use
+`locomotion.servo.configure_sts3215_like_lerobot` with the connected LeRobot
+`FeetechMotorsBus`; it writes and verifies this contract:
+
+```text
+Operating_Mode       = 0    # bounded position mode
+P_Coefficient        = 16
+I_Coefficient        = 0
+D_Coefficient        = 32
+Return_Delay_Time    = 0
+Maximum_Acceleration = 254
+Acceleration         = 254
+Goal_Velocity        = 0    # firmware maximum
+Goal_Time            = 0
+Phase bit 4           = 0    # bounded position mode
+```
+
+The PID values are LeRobot's current SO follower defaults. They make the
+hardware behavior deterministic, but the mapping from firmware coefficients
+to LeggyBot's effective joint stiffness and damping remains a pre-hardware
+approximation. Treat any future PID change as an actuator-model change: update
+the physical gains or identify a replacement model and retrain the policy.
+
+Continue sending all six goal positions in one synchronous write. Speed and
+acceleration are fixed servo configuration, not policy outputs and therefore
+do not belong in `JointCommand`. Reapply and verify the SRAM-backed values
+after reconnect or power-up; do not rely on a servo's previous state.
+
+Simulation applies the same nominal firmware profile after the modeled packet
+arrives: 3400 counts/s maximum velocity and 25,400 counts/s^2 acceleration,
+equivalent to 5.216 rad/s and 38.96 rad/s^2 at 4096 counts/revolution. The
+profile's setpoint then drives the existing MuJoCo motor model. Training varies
+the profile limits across servos, so a policy cannot depend on every unit
+having exactly the nominal response. These conversions are pre-hardware
+approximations; record commanded and reported positions at 200 Hz once the
+servos arrive, fit the actual ramp, and update the shared constants in
+`locomotion/servo.py`.
+
 ## State estimation
 
-`PassthroughStateEstimator` is deliberately a placeholder. MuJoCo publishes
-perfect base orientation plus IMU and joint sensor values; the placeholder uses
-the orientation directly to calculate projected gravity. The policy controller
+`Icm42688StateEstimator` consumes only raw gyro and accelerometer samples and
+produces the same filtered angular velocity and projected-gravity observations
+used during training. `base_orientation_wxyz` is optional diagnostic ground
+truth and is ignored by the production controller. `PassthroughStateEstimator`
+remains available only for tests and diagnostics. MuJoCo can publish
+perfect base orientation for diagnostics, but the simulated robot server now
+omits it to exercise the hardware-compatible path. The policy controller
 depends only on the `StateEstimator` interface.
 
-A hardware estimator can replace it with an error-state EKF or invariant EKF
-that consumes timestamped gyro, accelerometer, joint encoder, contact, and
-optional external pose/velocity measurements. It should update at sensor rate
-and provide a prediction at the policy evaluation timestamp. If the robot
-firmware already publishes a trustworthy orientation/state estimate, an adapter
-can populate the corrected state directly. Estimation mode and observation ABI
-must match what was randomized and validated during training.
+The six-axis filter cannot observe absolute yaw. If a later controller needs
+world position, heading, or velocity, add contact/kinematic and external
+measurements through an error-state or invariant EKF and retrain against that
+observation pipeline.
+
+The hardware bridge must configure the ICM-42688-P for +/-500 deg/s and +/-16 g
+and provide one coherent sample every 20 ms. Gyroscope values on the wire are
+body-frame rad/s; accelerometer values are body-frame m/s^2 and read about
+`[0, 0, +9.80665]` while the upright robot is stationary. Timestamp samples at
+acquisition, map the board axes into the robot body frame before fusion, and
+use a digital bandwidth near 20-25 Hz. If the sensor runs faster internally,
+read its FIFO and downsample coherently instead of sending an arbitrary latest
+register from each axis.
+
+Wire protocol v3 carries `joint_sample_time_ns` and `imu_sample_time_ns`
+separately. A hardware bridge should place the newest complete servo-bus sample
+and newest complete IMU sample in each state packet, preserving their original
+acquisition timestamps. The controller intentionally uses latest-wins data at
+its 50 Hz policy boundary. Training independently randomizes servo and IMU age
+between zero and one 20 ms policy frame while keeping all outputs from one
+physical device mutually coherent.
 
 ## Production assessment
 

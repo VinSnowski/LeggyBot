@@ -7,6 +7,11 @@ from dataclasses import dataclass, replace
 import mujoco
 import numpy as np
 
+from locomotion.servo import (
+    STS3215_POSITION_RESOLUTION_RAD,
+    quantize_position_numpy,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RobotProfile:
@@ -35,6 +40,7 @@ class RobotProfile:
     actuator_no_load_speed_rad_s: float = 4.712
     actuator_safe_torque_fraction: float = 0.80
     actuator_safe_speed_fraction: float = 0.80
+    position_resolution_rad: float | None = None
 
     def __post_init__(self) -> None:
         count = len(self.joint_names)
@@ -53,6 +59,11 @@ class RobotProfile:
             raise ValueError(f"{self.name}: invalid simulation timing")
         if self.actuator_stall_torque_nm <= 0 or self.actuator_no_load_speed_rad_s <= 0:
             raise ValueError(f"{self.name}: invalid actuator limits")
+        if (
+            self.position_resolution_rad is not None
+            and self.position_resolution_rad <= 0.0
+        ):
+            raise ValueError(f"{self.name}: invalid position resolution")
         for task_id, period in self.gait_clock_periods:
             if task_id not in self.compatible_task_ids and task_id != self.task_id:
                 raise ValueError(f"{self.name}: gait task {task_id!r} is not compatible")
@@ -118,7 +129,29 @@ class RobotProfile:
             normalized * (upper - nominal),
             normalized * (nominal - lower),
         )
-        return np.clip(target, self.array("joint_lower"), self.array("joint_upper"))
+        lower_limit = self.array("joint_lower")
+        upper_limit = self.array("joint_upper")
+        target = np.clip(target, lower_limit, upper_limit)
+        if self.position_resolution_rad is not None:
+            resolution = self.position_resolution_rad
+            target = quantize_position_numpy(target, resolution)
+            # Keep the result both representable and inside the physical
+            # limits even when a limit lies between two encoder counts.
+            quantized_lower = np.ceil(lower_limit / resolution) * resolution
+            quantized_upper = np.floor(upper_limit / resolution) * resolution
+            target = np.clip(target, quantized_lower, quantized_upper)
+        return target
+
+    def observed_joint_position(self, position: np.ndarray) -> np.ndarray:
+        """Apply the deployed servo's feedback resolution to joint positions."""
+        return self.quantize_joint_position(position)
+
+    def quantize_joint_position(self, position: np.ndarray) -> np.ndarray:
+        """Round a feedback or goal position to the servo's register grid."""
+        value = np.asarray(position)
+        if self.position_resolution_rad is None:
+            return value
+        return quantize_position_numpy(value, self.position_resolution_rad)
 
 
 LEGGYBOT_PROFILE = RobotProfile(
@@ -153,6 +186,7 @@ LEGGYBOT_PROFILE = RobotProfile(
     accelerometer_sensor="base_accelerometer",
     max_velocity_command=(0.5, 0.5, 0.5),
     max_abs_curvature=1.0,
+    position_resolution_rad=STS3215_POSITION_RESOLUTION_RAD,
 )
 
 
@@ -181,6 +215,7 @@ LEGGYBOT_FIXED_ANKLE_PROFILE = replace(
         "NaturalOmnidirectionalWalkingTask",
         "NaturalOmnidirectionalWalkingTaskV3",
         "NaturalOmnidirectionalWalkingTaskV4",
+        "NaturalOmnidirectionalWalkingTaskV5",
         "PeriodicRewardCompositionWalkingTask",
     ),
     gait_clock_periods=(
@@ -203,6 +238,7 @@ LEGGYBOT_FIXED_ANKLE_PROFILE = replace(
         ("NaturalOmnidirectionalWalkingTask", 0.33),
         ("NaturalOmnidirectionalWalkingTaskV3", 0.33),
         ("NaturalOmnidirectionalWalkingTaskV4", 0.33),
+        ("NaturalOmnidirectionalWalkingTaskV5", 0.33),
         ("PeriodicRewardCompositionWalkingTask", 0.33),
     ),
     # An 8-degree hip offset keeps the torso upright and the angled sole flat.

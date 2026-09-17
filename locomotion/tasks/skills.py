@@ -80,6 +80,7 @@ from locomotion.tasks.gait import (
     periodic_walk_evaluation_active,
     periodic_walk_success,
     quasi_omnidirectional_command_curriculum,
+    ForwardSpeedGateCurriculum,
     StagedQuasiOmnidirectionalCurriculum,
     quasi_omnidirectional_command_success,
     quasi_omnidirectional_velocity_success,
@@ -141,6 +142,7 @@ SE2_TRACKING_TASK_ID = "SE2TrackingWalkingTask"
 NATURAL_OMNIDIRECTIONAL_TASK_ID = "NaturalOmnidirectionalWalkingTask"
 NATURAL_OMNIDIRECTIONAL_V3_TASK_ID = "NaturalOmnidirectionalWalkingTaskV3"
 NATURAL_OMNIDIRECTIONAL_V4_TASK_ID = "NaturalOmnidirectionalWalkingTaskV4"
+NATURAL_OMNIDIRECTIONAL_V5_TASK_ID = "NaturalOmnidirectionalWalkingTaskV5"
 PERIODIC_REWARD_COMPOSITION_WALKING_TASK_ID = "PeriodicRewardCompositionWalkingTask"
 
 # RSL-RL's LeggyBot runner collects 24 environment steps per PPO iteration.
@@ -169,6 +171,7 @@ LOCOMOTION_TASK_IDS = (
     NATURAL_OMNIDIRECTIONAL_TASK_ID,
     NATURAL_OMNIDIRECTIONAL_V3_TASK_ID,
     NATURAL_OMNIDIRECTIONAL_V4_TASK_ID,
+    NATURAL_OMNIDIRECTIONAL_V5_TASK_ID,
     PERIODIC_REWARD_COMPOSITION_WALKING_TASK_ID,
 )
 
@@ -320,6 +323,7 @@ class QuasiOmnidirectionalMixtureCommandCfg(UniformVelocityCommandCfg):
     reverse_probability: float = 0.05
     protected_forward_range: tuple[float, float] = (0.04, 0.10)
     minimum_coupled_yaw_fraction: float = 0.25
+    scale_yaw_with_forward_speed: bool = True
     minimum_lateral_speed: float = 0.0
 
     def build(self, env):
@@ -393,11 +397,15 @@ class QuasiOmnidirectionalMixtureCommand(UniformVelocityCommand):
             magnitude = fraction + (1.0 - fraction) * torch.rand(
                 count, device=self.device
             )
+            speed_scale = (
+                torch.abs(vx) / forward_limit
+                if self.cfg.scale_yaw_with_forward_speed
+                else torch.ones_like(vx)
+            )
             return (
                 (2.0 * torch.randint(0, 2, (count,), device=self.device).float() - 1.0)
                 * yaw_limit
-                * torch.abs(vx)
-                / forward_limit
+                * speed_scale
                 * magnitude
             )
 
@@ -483,21 +491,25 @@ def _shared_skill_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # Keep a stable actor ABI across every skill, while applying sensor
     # corruption explicitly so each one tests robustness.
     from locomotion.tasks.gait import (
-        sim2real_base_ang_vel,
-        sim2real_joint_pos,
-        sim2real_joint_vel,
-        sim2real_projected_gravity,
+        Sim2RealImuAngularVelocity,
+        Sim2RealJointPosition,
+        Sim2RealJointVelocity,
+        Sim2RealImuProjectedGravity,
     )
 
     actor = cfg.observations["actor"]
-    actor.terms["base_ang_vel"].func = sim2real_base_ang_vel
-    actor.terms["base_ang_vel"].params = {"sensor_name": "robot/imu_ang_vel"}
-    actor.terms["projected_gravity"].func = sim2real_projected_gravity
-    actor.terms["projected_gravity"].params = {}
-    actor.terms["joint_pos"].func = sim2real_joint_pos
+    imu_params = {
+        "gyro_sensor_name": "robot/imu_ang_vel",
+        "accel_sensor_name": "robot/base_accelerometer",
+    }
+    actor.terms["base_ang_vel"].func = Sim2RealImuAngularVelocity
+    actor.terms["base_ang_vel"].params = imu_params.copy()
+    actor.terms["projected_gravity"].func = Sim2RealImuProjectedGravity
+    actor.terms["projected_gravity"].params = imu_params.copy()
+    actor.terms["joint_pos"].func = Sim2RealJointPosition
     actor.terms["joint_pos"].params = {}
-    actor.terms["joint_vel"].func = sim2real_joint_vel
-    actor.terms["joint_vel"].params = {}
+    actor.terms["joint_vel"].func = Sim2RealJointVelocity
+    actor.terms["joint_vel"].params = {"filter_alpha": 0.5}
     for term in actor.terms.values():
         term.noise = None
     for term in cfg.observations["critic"].terms.values():
@@ -1958,24 +1970,6 @@ def natural_omnidirectional_v3_env_cfg(play: bool = False) -> ManagerBasedRlEnvC
     command.minimum_coupled_yaw_fraction = .25
     command.resampling_time_range = (5., 8.)
     cfg.rewards["pitch_upright"].weight = 1.50
-    # Kept for ablation, but intentionally inactive while we measure whether
-    # it contributes to the left/right lateral-gait asymmetry. The function
-    # and the signed foot-line metrics below remain available for diagnosis.
-    # cfg.rewards["lateral_foot_line"] = RewardTermCfg(
-    #     func=commanded_lateral_foot_line_cost,
-    #     weight=-0.20,
-    #     params={
-    #         "command_name": "twist",
-    #         "line_scale": 0.025,
-    #         "period": 0.33,
-    #         "duty_factor": 0.70,
-    #         "transition_fraction": 0.04,
-    #         "min_lateral_speed": 0.04,
-    #         "max_forward_speed": 0.01,
-    #         "max_yaw_rate": 0.02,
-    #         "asset_cfg": _FOOT_SITES,
-    #     },
-    # )
     cfg.metrics["lateral_foot_line_error_m"] = MetricsTermCfg(
         func=lateral_foot_line_error,
         params={
@@ -2034,12 +2028,14 @@ def natural_omnidirectional_v4_env_cfg(play: bool = False) -> ManagerBasedRlEnvC
     """
     cfg = natural_omnidirectional_v3_env_cfg(play)
     command = cfg.commands['twist']
-    command.ranges.lin_vel_x = (0.0, .10)
+    command.ranges.lin_vel_x = (0.0, .20)
+    command.protected_forward_range = (.04, .20)
     command.reverse_probability = 0.0
     command.forward_straight_probability = .45
     command.forward_curve_probability = .45
     command.pure_lateral_probability = .0
-    # Remaining proportions: .30 straight, .30 curves, .10 stopped.
+    command.scale_yaw_with_forward_speed = False
+    # Deployment mixture: .45 straight, .45 curves, .10 stopped.
     cfg.rewards['lateral_foot_line'] = RewardTermCfg(
         func=commanded_lateral_foot_line_cost, weight=-.20,
         params={'command_name': 'twist', 'line_scale': .025,
@@ -2059,6 +2055,36 @@ def natural_omnidirectional_v4_env_cfg(play: bool = False) -> ManagerBasedRlEnvC
         func=WindowedSE2Tracking,
         params={'horizon_s': 1.0, 'output': 'cross_track_error'},
     )
+    return cfg
+
+
+def natural_omnidirectional_v5_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """Continue a complete V4 policy while probing its maximum forward speed."""
+    cfg = natural_omnidirectional_v4_env_cfg(play)
+    command = cfg.commands["twist"]
+    command.ranges.lin_vel_x = (0.0, 0.15)
+    command.protected_forward_range = (0.04, 0.15)
+    cfg.curriculum = {
+        "forward_speed_gate": CurriculumTermCfg(
+            func=ForwardSpeedGateCurriculum(
+                speed_levels=(0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50),
+                success_threshold=0.70,
+                success_window_iterations=50,
+                minimum_gate_iterations=100,
+                steps_per_iteration=24,
+                minimum_forward_speed=0.04,
+                metric_name="tracking_success",
+            )
+        )
+    }
+    if not play:
+        # V5 starts from a V4 policy that has already completed the independent
+        # mismatch ramp, so retain that terminal distribution from iteration 0.
+        cfg.events["domain_randomization"] = EventTermCfg(
+            func=updated_default_domain_randomization,
+            mode="reset",
+            params={"symmetric_steps": 0, "independent_ramp_steps": 0},
+        )
     return cfg
 
 
@@ -2453,6 +2479,18 @@ def locomotion_tasks() -> tuple[LocomotionTask, ...]:
             NATURAL_OMNIDIRECTIONAL_V4_TASK_ID,
             natural_omnidirectional_v4_env_cfg,
             'leggybot_natural_omnidirectional_walking_v4',
+            tracking_success, periodic_walk_evaluation_active, .80,
+            use_symmetry_augmentation=True,
+            symmetry_mirror_loss_coeff=.05,
+            bounded_exploration=True,
+            exploration_init_std=.15,
+            exploration_std_range=(.03, .40),
+            learning_rate=1e-3,
+        ),
+        LocomotionTask(
+            NATURAL_OMNIDIRECTIONAL_V5_TASK_ID,
+            natural_omnidirectional_v5_env_cfg,
+            "leggybot_natural_omnidirectional_walking_v5",
             tracking_success, periodic_walk_evaluation_active, .80,
             use_symmetry_augmentation=True,
             symmetry_mirror_loss_coeff=.05,

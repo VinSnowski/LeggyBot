@@ -23,13 +23,14 @@ from locomotion.robot_profiles import (
     get_robot_profile,
     robot_choices,
 )
+from locomotion.servo import PositionBasedVelocityEstimator
 from locomotion.robot_protocol import (
     ControllerTransport,
     JointCommand,
     UdpControllerTransport,
     monotonic_time_ns,
 )
-from locomotion.state_estimation import PassthroughStateEstimator, StateEstimator
+from locomotion.state_estimation import Icm42688StateEstimator, StateEstimator
 
 
 class TerminalVelocityCommand:
@@ -124,7 +125,7 @@ class TerminalVelocityCommand:
 class JoystickVelocityCommand:
     """Continuous vx/yaw command from the DualSense left analog stick."""
 
-    linear_velocity_limit = 0.10
+    linear_velocity_limit = 0.20
     yaw_velocity_limit = 0.40
     stick_deadzone = 0.08
     yaw_deadband_rad = math.radians(8.0)
@@ -228,6 +229,9 @@ class PolicyController:
             getattr(policy, "task_id", None)
         )
         self.gait_phase_origin_ns: int | None = None
+        self.joint_velocity_estimator = PositionBasedVelocityEstimator(
+            1.0 / control_hz
+        )
 
     def receive_available_states(self, now_ns: int) -> None:
         for state in self.transport.receive_states():
@@ -259,14 +263,24 @@ class PolicyController:
         if stale:
             self.last_action[:] = 0.0
             self.gait_phase_origin_ns = None
+            self.joint_velocity_estimator.reset()
+            self.estimator.reset()
             target = self.profile.array("default_joint_pos", dtype=np.float32)
         else:
             default_pos = self.profile.array("default_joint_pos", dtype=np.float32)
+            observed_position = self.profile.observed_joint_position(
+                state.joint_position
+            )
+            observed_velocity = (
+                state.joint_velocity
+                if self.profile.position_resolution_rad is None
+                else self.joint_velocity_estimator.update(observed_position)
+            )
             terms = [
                     state.base_angular_velocity,
                     state.projected_gravity,
-                    state.joint_position - default_pos,
-                    state.joint_velocity,
+                    observed_position - default_pos,
+                    observed_velocity,
                     self.last_action,
                     velocity_command,
             ]
@@ -355,7 +369,7 @@ def main() -> None:
     controller = PolicyController(
         policy,
         transport,
-        PassthroughStateEstimator(),
+        Icm42688StateEstimator(),
         profile,
         control_hz=args.control_hz,
         state_timeout_s=args.state_timeout,

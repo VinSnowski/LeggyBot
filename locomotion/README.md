@@ -20,15 +20,17 @@ and 30% curved forward. During pure lateral commands the foot-line penalty
 discourages scissoring without constraining the swing phase. The task is
 intended to train from a blank policy.
 
-V3 pairs servo gain, effort-limit, encoder-bias and delay samples through
+V3 pairs servo gain, effort-limit, and calibration samples through
 iteration 500. It restores nominal leg inertias on each reset and varies torso
 mass, central inertia and fore/aft/vertical COM without changing lateral COM.
 From iterations 500–800 it interpolates physical pseudo-inertia matrices and
-continuous servo parameters toward full independent samples. Discrete delay
-mismatch is introduced in a growing fraction of environments. From iteration
-800 onward resets use the original full independent randomization. Episodes
-retain their samples until reset. `independent_ramp_steps=0` keeps the optional
-hard switch; `full_domain_randomization` remains directly callable.
+continuous servo parameters toward full independent samples. Command delay
+remains common to all six servos because one synchronized packet owns it; its
+episode baseline and runtime jitter remain randomized throughout. From
+iteration 800 onward resets use full independent servo and leg randomization.
+Episodes retain physical/calibration samples until reset.
+`independent_ramp_steps=0` keeps the optional hard switch;
+`full_domain_randomization` remains directly callable.
 
 Signed TensorBoard metrics include zeros for inactive modes. For a conditional
 left/right success estimate, divide the averaged signed `tracking_success` by
@@ -210,9 +212,13 @@ one that truly alternates legs without a twitching or dragging exploit. The
 values above are promotion gates, not a substitute for observing the policy in
 simulation.
 
-The promotion tasks use the same active sim-to-real envelope: foot friction,
-mass/inertia, actuator PD gains and effort limits, encoder bias, 0–10 ms command
-latency, IMU/joint observation noise, and small pushes. `UpdatedDefaultWalkingTask`
+The promotion tasks use the same active sim-to-real envelope: collision-only
+sole mounting and height error, compliant-contact dynamics, three-axis foot
+friction, small floor slopes, mass/inertia, actuator PD gains and effort limits,
+shared command/feedback servo calibration, an STS3215 firmware
+velocity/acceleration profile, 5–15 ms base
+command latency with correlated jitter, IMU/joint observation noise, and small
+pushes. `UpdatedDefaultWalkingTask`
 uses paired left/right actuator and encoder variation for its first 12,000 steps,
 then the same full envelope. The current backlash placeholder is deliberately
 disabled until an assembled joint is measured.

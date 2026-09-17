@@ -19,6 +19,7 @@ from locomotion.robot_profiles import (
     make_native_model,
     robot_choices,
 )
+from locomotion.servo import PositionSetpointProfiler
 from locomotion.robot_protocol import (
     JointCommand,
     RawRobotState,
@@ -72,7 +73,11 @@ class MujocoRobotServer:
         self.state_sequence = 0
         self.timed_out = True
         reset_robot(self.model, self.data, self.qpos_addresses, profile)
-        self.data.ctrl[self.control_ids] = profile.array("default_joint_pos")
+        nominal_target = profile.quantize_joint_position(
+            profile.array("default_joint_pos")
+        )
+        self.position_profiler = PositionSetpointProfiler(nominal_target)
+        self.data.ctrl[self.control_ids] = nominal_target
 
     def _body_velocity(self) -> np.ndarray:
         velocity_rot_lin = np.zeros(6, dtype=np.float64)
@@ -143,7 +148,12 @@ class MujocoRobotServer:
             sent_time_ns=now_ns,
             robot_name=self.profile.name,
             joint_names=self.profile.joint_names,
-            joint_position=tuple(float(x) for x in self.data.qpos[self.qpos_addresses]),
+            joint_position=tuple(
+                float(x)
+                for x in self.profile.observed_joint_position(
+                    self.data.qpos[self.qpos_addresses]
+                )
+            ),
             joint_velocity=tuple(float(x) for x in self.data.qvel[self.dof_addresses]),
             imu_angular_velocity=tuple(
                 float(x)
@@ -157,7 +167,11 @@ class MujocoRobotServer:
                     self.accel_address : self.accel_address + 3
                 ]
             ),
-            base_orientation_wxyz=tuple(float(x) for x in self.data.qpos[3:7]),
+            # Diagnostic simulation follows the real robot wire contract: the
+            # controller must estimate attitude from the 6-axis IMU.
+            base_orientation_wxyz=None,
+            joint_sample_time_ns=round(self.data.time * 1.0e9),
+            imu_sample_time_ns=round(self.data.time * 1.0e9),
         )
         self.state_sequence += 1
         return state
@@ -166,7 +180,11 @@ class MujocoRobotServer:
         now_ns = monotonic_time_ns() if now_ns is None else now_ns
         command = self._accept_latest_command(now_ns)
         if command is not None:
-            self.data.ctrl[self.control_ids] = np.asarray(command.position_target)
+            self.position_profiler.set_goal(
+                self.profile.quantize_joint_position(
+                    np.asarray(command.position_target)
+                )
+            )
             self.last_velocity_command[:] = command.velocity_command
 
         previously_timed_out = self.timed_out
@@ -181,9 +199,16 @@ class MujocoRobotServer:
         if self.timed_out:
             # A real robot driver should additionally cut torque or enter its own
             # certified safe state. The simulator holds this profile's nominal pose.
-            self.data.ctrl[self.control_ids] = self.profile.array("default_joint_pos")
+            self.position_profiler.set_goal(
+                self.profile.quantize_joint_position(
+                    self.profile.array("default_joint_pos")
+                )
+            )
             self.last_velocity_command[:] = 0.0
 
+        self.data.ctrl[self.control_ids] = self.position_profiler.update(
+            self.profile.physics_dt
+        )
         mujoco.mj_step(self.model, self.data)
         self._print_velocity_comparison()
         if self.data.time + 1.0e-12 >= self.next_publish_time_s:

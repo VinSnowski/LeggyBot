@@ -16,6 +16,7 @@ class TaskStampedOnPolicyRunner(VelocityOnPolicyRunner):
 
     task_id: str
     initialize_actor_only = False
+    preserve_initialized_policy_std = False
 
     def _restore_environment_state(self, infos: dict | None) -> None:
         if not infos:
@@ -54,7 +55,11 @@ class TaskStampedOnPolicyRunner(VelocityOnPolicyRunner):
             actor_state = {
                 key: value
                 for key, value in source.items()
-                if key in target and not key.endswith(("std_param", "log_std_param"))
+                if key in target
+                and (
+                    self.preserve_initialized_policy_std
+                    or not key.endswith(("std_param", "log_std_param"))
+                )
             }
             self.alg._raw_actor.load_state_dict(actor_state, strict=False)
             infos = checkpoint.get("infos", {})
