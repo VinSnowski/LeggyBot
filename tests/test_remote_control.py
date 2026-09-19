@@ -6,7 +6,7 @@ import pytest
 from locomotion.mujoco_robot_server import MujocoRobotServer
 from locomotion.remote_controller import PolicyController, TerminalVelocityCommand
 from locomotion.robot_profiles import LEGGYBOT_FIXED_ANKLE_PROFILE
-from locomotion.tasks.skills import ANIMATED_REFERENCE_WALK_TASK_ID
+from locomotion.tasks import WALKING_TASK_ID
 from locomotion.robot_protocol import (
     JointCommand,
     RawRobotState,
@@ -284,7 +284,7 @@ def test_controller_generates_the_same_gait_clock_as_training() -> None:
     class GaitPolicy:
         observation_dim = 29
         action_dim = 6
-        task_id = ANIMATED_REFERENCE_WALK_TASK_ID
+        task_id = WALKING_TASK_ID
 
         def __init__(self):
             self.observations = []

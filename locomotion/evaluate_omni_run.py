@@ -2,9 +2,7 @@
 
 The run passes when at least one checkpoint satisfies every fixed-command mode.
 This deliberately selects by the worst configured mode instead of averaging
-easy forward or stop samples over failed lateral or turning behavior. V3 is
-checked in both signs of lateral and forward-plus-yaw motion, plus stop,
-forward, and backward travel.
+easy forward or stop samples over failed turning behavior.
 """
 
 from __future__ import annotations
@@ -20,68 +18,29 @@ import torch
 
 from locomotion.evaluate_task import _load_actor
 from locomotion.task import make_env_cfg
-from locomotion.tasks.skills import (
-    NATURAL_OMNIDIRECTIONAL_TASK_ID,
-    NATURAL_OMNIDIRECTIONAL_V3_TASK_ID,
-    NATURAL_OMNIDIRECTIONAL_V4_TASK_ID,
-    NATURAL_OMNIDIRECTIONAL_V5_TASK_ID,
-    PERIODIC_REWARD_COMPOSITION_WALKING_TASK_ID,
-    QUASI_OMNIDIRECTIONAL_WALKING_TASK_ID,
-    QUASI_OMNIDIRECTIONAL_WALKING_V2_TASK_ID,
-    SE2_TRACKING_TASK_ID,
-)
+from locomotion.tasks import WALKING_TASK_ID
 
 
 COMMANDS: dict[str, tuple[float, float, float]] = {
     "stop": (0.0, 0.0, 0.0),
     "forward": (0.08, 0.0, 0.0),
-    "left": (0.0, 0.06, 0.0),
-    "right": (0.0, -0.06, 0.0),
     "curve_left": (0.08, 0.0, 0.30),
     "curve_right": (0.08, 0.0, -0.30),
-    "backward": (-0.05, 0.0, 0.0),
 }
 
-V3_COMMANDS: dict[str, tuple[float, float, float]] = {
-    "stop": COMMANDS["stop"],
-    "forward": COMMANDS["forward"],
-    "backward": COMMANDS["backward"],
-    "left": COMMANDS["left"],
-    "right": COMMANDS["right"],
-    "curve_left": COMMANDS["curve_left"],
-    "curve_right": COMMANDS["curve_right"],
-}
-
-V4_COMMANDS: dict[str, tuple[float, float, float]] = {
+WALKING_COMMANDS: dict[str, tuple[float, float, float]] = {
     name: COMMANDS[name]
     for name in ("stop", "forward", "curve_left", "curve_right")
 }
 
-AXIS_EXCLUSIVE_COMMANDS: dict[str, tuple[float, float, float]] = {
-    name: COMMANDS[name] for name in ("stop", "forward", "left", "right")
-}
-
-SUPPORTED_TASKS = {
-    NATURAL_OMNIDIRECTIONAL_TASK_ID,
-    NATURAL_OMNIDIRECTIONAL_V3_TASK_ID,
-    NATURAL_OMNIDIRECTIONAL_V4_TASK_ID,
-    NATURAL_OMNIDIRECTIONAL_V5_TASK_ID,
-    PERIODIC_REWARD_COMPOSITION_WALKING_TASK_ID,
-    QUASI_OMNIDIRECTIONAL_WALKING_TASK_ID,
-    QUASI_OMNIDIRECTIONAL_WALKING_V2_TASK_ID,
-    SE2_TRACKING_TASK_ID,
-}
+SUPPORTED_TASKS = {WALKING_TASK_ID}
 
 
 def commands_for_task(task_id: str) -> dict[str, tuple[float, float, float]]:
-    """Return only command modes that the selected task actually trains."""
-    if task_id == PERIODIC_REWARD_COMPOSITION_WALKING_TASK_ID:
-        return AXIS_EXCLUSIVE_COMMANDS
-    if task_id == NATURAL_OMNIDIRECTIONAL_V3_TASK_ID:
-        return V3_COMMANDS
-    if task_id in (NATURAL_OMNIDIRECTIONAL_V4_TASK_ID, NATURAL_OMNIDIRECTIONAL_V5_TASK_ID):
-        return V4_COMMANDS
-    return COMMANDS
+    """Return the fixed command modes used to evaluate walking."""
+    if task_id != WALKING_TASK_ID:
+        raise ValueError(f"Unsupported task: {task_id!r}")
+    return WALKING_COMMANDS
 
 
 @dataclass(frozen=True)
@@ -610,11 +569,11 @@ def main() -> int:
     from mjlab.envs import ManagerBasedRlEnv
 
     env = ManagerBasedRlEnv(cfg, device=str(device))
-    objectives = (
-        Objectives(maximum_linear_error_mps=.02, maximum_yaw_error_radps=.04,
-                   maximum_path_rmse_m=.06, maximum_heading_rmse_rad=.12)
-        if task_id in (NATURAL_OMNIDIRECTIONAL_V4_TASK_ID, NATURAL_OMNIDIRECTIONAL_V5_TASK_ID)
-        else Objectives()
+    objectives = Objectives(
+        maximum_linear_error_mps=.02,
+        maximum_yaw_error_radps=.04,
+        maximum_path_rmse_m=.06,
+        maximum_heading_rmse_rad=.12,
     )
     evaluated = []
     try:
@@ -629,8 +588,7 @@ def main() -> int:
             modes = evaluate_checkpoint(
                 env, actor, commands, mode_commands, seconds=args.seconds, warmup_s=args.warmup,
                 replicas=replicas, objectives=objectives,
-                include_lateral_foot_line=(task_id in (
-                    NATURAL_OMNIDIRECTIONAL_V3_TASK_ID, NATURAL_OMNIDIRECTIONAL_V4_TASK_ID)),
+                include_lateral_foot_line=False,
             )
             mode_ratios = {name: mode["judgement"]["worst_ratio"] for name, mode in modes.items()}
             worst_mode = max(mode_ratios, key=mode_ratios.get)

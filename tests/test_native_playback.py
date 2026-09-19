@@ -25,12 +25,11 @@ from locomotion.robot_profiles import (
 )
 from locomotion.servo import PositionBasedVelocityEstimator
 from locomotion.watch_policy_sequence import (
-    COMMAND_SEQUENCE,
     TOTAL_DURATION_S,
-    V4_COMMAND_SEQUENCE,
+    WALKING_COMMAND_SEQUENCE,
     _local_pose_delta,
     command_segment_at,
-    command_sequence_for_task,
+    command_sequence,
     run_sequence,
     sequence_duration,
 )
@@ -40,7 +39,7 @@ def test_native_loop_feeds_back_clipped_action() -> None:
     profile = LEGGYBOT_FIXED_ANKLE_PROFILE
 
     class SaturatingPolicy:
-        task_id = "SE2TrackingWalkingTask"
+        task_id = "WalkingTask"
 
         def __init__(self):
             self.observations = []
@@ -59,13 +58,13 @@ def test_native_loop_feeds_back_clipped_action() -> None:
 
 def test_scripted_command_sequence_has_exact_half_open_boundaries() -> None:
     assert TOTAL_DURATION_S == 55.
-    assert [segment.command for segment in COMMAND_SEQUENCE] == [
+    assert [segment.command for segment in WALKING_COMMAND_SEQUENCE] == [
         (0., 0., 0.),
         (.08, 0., 0.),
-        (-.05, 0., 0.),
         (0., .06, 0.),
         (0., -.06, 0.),
         (.08, 0., .30),
+        (.08, 0., -.30),
     ]
     assert command_segment_at(4.999)[0] == 0
     assert command_segment_at(5.)[0] == 1
@@ -85,15 +84,13 @@ def test_local_pose_delta_uses_the_segment_start_frame() -> None:
     )
 
 
-def test_no_lateral_sequence_retains_forward_and_both_v4_curves() -> None:
-    sequence = command_sequence_for_task(
-        "NaturalOmnidirectionalWalkingTaskV4", no_lateral=True
-    )
+def test_no_lateral_sequence_retains_forward_and_both_curves() -> None:
+    sequence = command_sequence(no_lateral=True)
     assert sequence == (
-        V4_COMMAND_SEQUENCE[0],
-        V4_COMMAND_SEQUENCE[1],
-        V4_COMMAND_SEQUENCE[4],
-        V4_COMMAND_SEQUENCE[5],
+        WALKING_COMMAND_SEQUENCE[0],
+        WALKING_COMMAND_SEQUENCE[1],
+        WALKING_COMMAND_SEQUENCE[4],
+        WALKING_COMMAND_SEQUENCE[5],
     )
     assert sequence_duration(sequence) == 35.
     assert command_segment_at(15., sequence)[1].command == (.08, 0., .30)
@@ -106,7 +103,7 @@ def test_scripted_native_playback_runs_policy_at_50_hz(capsys) -> None:
     profile = LEGGYBOT_FIXED_ANKLE_PROFILE
 
     class ZeroPolicy:
-        task_id = "PeriodicRewardCompositionWalkingTask"
+        task_id = "WalkingTask"
         observation_dim = 29
         action_dim = 6
 

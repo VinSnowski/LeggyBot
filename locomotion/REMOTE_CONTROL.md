@@ -24,7 +24,7 @@ another:
 uv run python -m locomotion.mujoco_robot_server
 
 uv run python -m locomotion.remote_controller \
-  logs/rsl_rl/leggybot_skill_animated_reference_walk/<run>/model_4999.pt
+  logs/rsl_rl/leggybot_walking/<run>/model_1999.pt
 ```
 
 Go1 remains available, but both endpoints must select it explicitly:

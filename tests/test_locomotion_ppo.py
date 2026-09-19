@@ -115,9 +115,9 @@ def test_checkpoint_backend_is_detected(
 def test_lightweight_playback_preserves_actor_abi() -> None:
     from locomotion.task import make_env_cfg
 
-    from locomotion.tasks import STAND_TASK_ID
+    from locomotion.tasks import WALKING_TASK_ID
 
-    cfg = make_env_cfg(STAND_TASK_ID, num_envs=1, seed=123, play=True)
+    cfg = make_env_cfg(WALKING_TASK_ID, num_envs=1, seed=123, play=True)
     actor_terms = tuple(cfg.observations["actor"].terms)
     optimize_env_cfg_for_playback(cfg)
 

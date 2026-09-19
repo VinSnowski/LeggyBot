@@ -12,7 +12,7 @@ from mjlab.tasks.velocity.rl import VelocityOnPolicyRunner
 
 
 class TaskStampedOnPolicyRunner(VelocityOnPolicyRunner):
-    """Store task metadata and support actor-only skill transfer."""
+    """Store task metadata and support actor-only initialization."""
 
     task_id: str
     initialize_actor_only = False

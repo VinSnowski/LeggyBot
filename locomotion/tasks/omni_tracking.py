@@ -161,7 +161,7 @@ class WindowedSE2Tracking(ManagerTermBase):
                 & (command[:, 2].abs() <= max_yaw_rate)
             )
             # MetricsManager averages all environments.  Inactive samples are
-            # zero by design; the paired active-fraction metrics in V3 make
+            # zero by design; paired active-fraction metrics make
             # the conditional success rate recoverable without hiding a sign.
             return success * active.to(success.dtype)
         scaled = error / error.new_tensor((linear_scale, linear_scale, yaw_scale))

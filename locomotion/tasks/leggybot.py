@@ -1,9 +1,4 @@
-"""Shared fixed-ankle LeggyBot model and PPO configuration.
-
-The old all-in-one gait task was intentionally removed.  Locomotion skills are
-defined as ordinary tasks in :mod:`locomotion.tasks.skills` and can be trained
-by either PPO entry point through their task ID.
-"""
+"""Shared fixed-ankle LeggyBot model and PPO configuration."""
 
 from __future__ import annotations
 
@@ -147,7 +142,7 @@ def get_leggybot_robot_cfg(
 
 
 def leggybot_ppo_runner_cfg(
-    experiment_name: str = "leggybot_skill",
+    experiment_name: str = "leggybot_walking",
     *,
     use_symmetry_augmentation: bool = False,
     symmetry_mirror_loss_coeff: float = 0.0,
@@ -167,8 +162,7 @@ def leggybot_ppo_runner_cfg(
             obs_normalization=True,
             distribution_cfg={
                 "class_name": "GaussianDistribution",
-                # Enough normalized exploration to discover swing at the 55%
-                # bootstrap range; the curriculum still limits target authority.
+                # Enough normalized exploration to discover a useful gait.
                 "init_std": exploration_init_std,
                 "std_type": "log" if bounded_exploration else "scalar",
                 **(
@@ -217,7 +211,7 @@ def leggybot_ppo_runner_cfg(
 
 
 def _leggybot_base_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-    """Build shared simulation pieces for any current LeggyBot skill."""
+    """Build the robot and simulator foundation for walking."""
     cfg = make_velocity_env_cfg()
     cfg.scene.entities = {
         "robot": get_leggybot_robot_cfg(ankle_pitch_deg=FIXED_ANKLE_PITCH_DEG)
@@ -277,7 +271,7 @@ def _leggybot_base_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         target_upper=dict(
             zip(LEGGYBOT_FIXED_ANKLE_PROFILE.joint_names, action_upper.tolist(), strict=True)
         ),
-        # Registered skills use the full safe joint range in both training and
+        # Walking uses the full safe joint range in both training and
         # playback.  Keeping this identical avoids an otherwise silent policy
         # to actuator-authority mismatch at evaluation or deployment time.
         initial_range_fraction=1.0,

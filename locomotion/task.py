@@ -11,14 +11,10 @@ if TYPE_CHECKING:
 
 
 def register_tasks() -> None:
-    """Register every implemented locomotion task."""
-    from locomotion.tasks import register_leggybot_skill_tasks
+    """Register the walking task exactly once."""
+    from locomotion.tasks import register_leggybot_tasks
 
-    register_leggybot_skill_tasks()
-
-
-# Compatibility for existing callers; new code should use the more accurate name.
-register_builtin_tasks = register_tasks
+    register_leggybot_tasks()
 
 
 def make_env_cfg(
@@ -52,9 +48,9 @@ def make_env_cfg(
     actor_cfg = cfg.observations["actor"]
     actor_cfg.terms.pop("base_lin_vel", None)
 
-    # A task can own its robot model and sim-to-real randomization. Applying
+    # The task owns its robot model and sim-to-real randomization. Applying
     # generic velocity-task events there would duplicate or conflict with the
-    # task definition, regardless of robot or skill name.
+    # generic velocity-task events would duplicate or conflict with it.
     if getattr(cfg, "manages_sim2real_randomization", False):
         cfg.sim2real_randomization_enabled = bool(
             sim2real_randomization and not play

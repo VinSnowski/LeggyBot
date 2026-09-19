@@ -9,7 +9,7 @@ from locomotion.evaluate_omni_run import (
     discover_checkpoints,
     judge_mode,
 )
-from locomotion.tasks.skills import NATURAL_OMNIDIRECTIONAL_V4_TASK_ID
+from locomotion.tasks import WALKING_TASK_ID
 
 
 def moving_metrics(**overrides):
@@ -64,7 +64,7 @@ def test_mode_judgement_rejects_sustained_or_oscillating_base_pitch():
     assert not oscillating["checks"]["base_pitch_rms"]
 
 
-def test_v3_lateral_judgement_enforces_foot_line_error():
+def test_lateral_judgement_enforces_foot_line_error():
     objectives = Objectives()
     assert judge_mode(
         "left", moving_metrics(), objectives, include_lateral_foot_line=True
@@ -106,8 +106,8 @@ def test_checkpoint_discovery_is_numeric_and_always_includes_final(tmp_path: Pat
         discover_checkpoints(tmp_path, start=200, end=None, stride=50)
 
 
-def test_v4_evaluation_matches_its_trained_command_modes():
-    assert tuple(commands_for_task(NATURAL_OMNIDIRECTIONAL_V4_TASK_ID)) == (
+def test_evaluation_matches_the_trained_command_modes():
+    assert tuple(commands_for_task(WALKING_TASK_ID)) == (
         "stop",
         "forward",
         "curve_left",

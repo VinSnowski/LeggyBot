@@ -1,4 +1,4 @@
-"""Watch a checkpoint execute six command modes in native CPU MuJoCo.
+"""Watch a walking checkpoint execute its command sequence in native MuJoCo.
 
 The runtime uses the same deployment observation and action contract as
 ``locomotion.remote_controller``: physics advances at 200 Hz, the policy runs
@@ -46,23 +46,20 @@ class CommandSegment:
     label: str
 
 
-COMMAND_SEQUENCE = (
+WALKING_COMMAND_SEQUENCE = (
     CommandSegment(5.0, (0.0, 0.0, 0.0), "stand"),
     CommandSegment(10.0, (0.08, 0.0, 0.0), "forward 0.08 m/s"),
-    CommandSegment(10.0, (-0.05, 0.0, 0.0), "backward 0.05 m/s"),
     CommandSegment(10.0, (0.0, 0.06, 0.0), "left 0.06 m/s"),
     CommandSegment(10.0, (0.0, -0.06, 0.0), "right 0.06 m/s"),
     CommandSegment(10.0, (0.08, 0.0, 0.30), "forward + yaw left"),
-)
-TOTAL_DURATION_S = sum(segment.duration_s for segment in COMMAND_SEQUENCE)
-V4_COMMAND_SEQUENCE = (
-    COMMAND_SEQUENCE[0], COMMAND_SEQUENCE[1],
-    COMMAND_SEQUENCE[3], COMMAND_SEQUENCE[4], COMMAND_SEQUENCE[5],
     CommandSegment(10.0, (0.08, 0.0, -0.30), "forward + yaw right"),
 )
-V4_NO_LATERAL_COMMAND_SEQUENCE = (
-    V4_COMMAND_SEQUENCE[0], V4_COMMAND_SEQUENCE[1],
-    V4_COMMAND_SEQUENCE[4], V4_COMMAND_SEQUENCE[5],
+TOTAL_DURATION_S = sum(segment.duration_s for segment in WALKING_COMMAND_SEQUENCE)
+WALKING_NO_LATERAL_COMMAND_SEQUENCE = (
+    WALKING_COMMAND_SEQUENCE[0],
+    WALKING_COMMAND_SEQUENCE[1],
+    WALKING_COMMAND_SEQUENCE[4],
+    WALKING_COMMAND_SEQUENCE[5],
 )
 
 
@@ -70,17 +67,8 @@ def sequence_duration(sequence: tuple[CommandSegment, ...]) -> float:
     return sum(segment.duration_s for segment in sequence)
 
 
-def command_sequence_for_task(
-    task_id: str | None, *, no_lateral: bool = False,
-) -> tuple[CommandSegment, ...]:
-    sequence = (
-        V4_COMMAND_SEQUENCE
-        if task_id in (
-            "NaturalOmnidirectionalWalkingTaskV4",
-            "NaturalOmnidirectionalWalkingTaskV5",
-        )
-        else COMMAND_SEQUENCE
-    )
+def command_sequence(*, no_lateral: bool = False) -> tuple[CommandSegment, ...]:
+    sequence = WALKING_COMMAND_SEQUENCE
     if no_lateral:
         sequence = tuple(
             segment for segment in sequence
@@ -94,7 +82,8 @@ def command_sequence_for_task(
 
 
 def command_segment_at(
-    elapsed_s: float, sequence: tuple[CommandSegment, ...] = COMMAND_SEQUENCE,
+    elapsed_s: float,
+    sequence: tuple[CommandSegment, ...] = WALKING_COMMAND_SEQUENCE,
 ) -> tuple[int, CommandSegment]:
     """Return the active segment using half-open, exact schedule intervals."""
     if elapsed_s < 0.0:
@@ -176,9 +165,7 @@ def run_sequence(
     imu_estimator = Icm42688OrientationEstimator()
     observation_age = ObservationAgeModel()
     position_profiler = make_position_profiler(profile)
-    sequence = command_sequence_for_task(
-        getattr(policy, "task_id", None), no_lateral=no_lateral
-    )
+    sequence = command_sequence(no_lateral=no_lateral)
     duration_s = sequence_duration(sequence)
     if stop_after_s is None:
         stop_after_s = duration_s
@@ -388,7 +375,7 @@ def main() -> None:
         f"Loaded {backend} {profile.name} policy from {args.checkpoint} on CPU\n"
         f"MuJoCo physics: {1.0 / profile.physics_dt:g} Hz; "
         f"policy control: {1.0 / profile.control_dt:g} Hz; "
-        f"duration: {sequence_duration(command_sequence_for_task(checkpoint_task, no_lateral=args.no_lateral)):g} s",
+        f"duration: {sequence_duration(command_sequence(no_lateral=args.no_lateral)):g} s",
         flush=True,
     )
     result = run_sequence(

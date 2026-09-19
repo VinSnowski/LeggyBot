@@ -10,7 +10,7 @@ import torch
 from locomotion import DEFAULT_TASK_ID
 from locomotion.ppo import load_custom_policy
 from locomotion.task import make_env_cfg
-from locomotion.tasks.skills import (
+from locomotion.tasks import (
     LOCOMOTION_TASK_IDS,
     get_locomotion_task,
 )
@@ -53,10 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--no-sim2real-randomization", action="store_true")
-    parser.add_argument(
-        "--sagittal-command", type=float,
-        help="Evaluate one held-out sagittal command (e.g. -0.42 or 0.42 m/s).",
-    )
     return parser.parse_args()
 
 
@@ -95,16 +91,6 @@ def main() -> int:
     try:
         env.common_step_counter = common_step_counter
         observations, _ = env.reset(seed=args.seed)
-        command_term = env.command_manager.get_term("twist")
-        if args.sagittal_command is not None:
-            if (not task.accepts_sagittal_command or abs(args.sagittal_command) < 0.05
-                    or abs(args.sagittal_command) > 0.5):
-                raise ValueError("--sagittal-command must be between -0.5 and -0.05 or 0.05 and 0.5 for the sagittal task")
-            command_term.cfg.resampling_time_range = (1.0e9, 1.0e9)
-            command = torch.full((args.num_envs,), args.sagittal_command, device=device)
-            command_term.vel_command_b[:, 0] = command
-            command_term.vel_command_b[:, 1:] = 0.0
-            command_term.vel_command_w[:] = command_term.vel_command_b
         actor_obs = observations["actor"]
         accum = torch.zeros(args.num_envs, device=device)
         active_counts = torch.zeros(args.num_envs, device=device)
@@ -129,10 +115,6 @@ def main() -> int:
                 accum[ids] = 0.0
                 active_counts[ids] = 0.0
                 reset_obs, _ = env.reset(env_ids=ids)
-                if args.sagittal_command is not None:
-                    command_term.vel_command_b[ids, 0] = args.sagittal_command
-                    command_term.vel_command_b[ids, 1:] = 0.0
-                    command_term.vel_command_w[ids] = command_term.vel_command_b[ids]
                 actor_obs = observations["actor"].clone()
                 actor_obs[ids] = reset_obs["actor"][ids]
             else:

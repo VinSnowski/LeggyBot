@@ -103,7 +103,7 @@ class TerminalVelocityCommand:
         return True
 
     def _clamp_target(self) -> None:
-        # Match the quasi-omnidirectional task envelope: linear commands are
+        # Match the walking task envelope: linear commands are
         # bounded to +/-0.10 m/s and yaw to +/-pi/4 rad/s.  Do not apply the
         # legacy profile curvature cap here; it would prevent Q/E from
         # reaching the task's yaw range (and would couple yaw to vx).

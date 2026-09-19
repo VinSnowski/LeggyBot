@@ -5,7 +5,7 @@
 URDF inspection viewer.
 
 `mjcf/NewLeggyBot.xml` is the authoritative MuJoCo model used by the fixed-ankle
-training tasks. It matches `../LeggyBot/mjcf/LeggyBot.xml` in solver settings,
+walking task. It matches `../LeggyBot/mjcf/LeggyBot.xml` in solver settings,
 floating base, base/hip/thigh bodies, joint limits and dynamics, actuators,
 non-foot primitive collisions, sensors, and visualization. Its only mechanical
 departure is the separate shin and smaller foot connected by the CAD-derived

@@ -29,7 +29,7 @@
     <texture name="ground_tex" type="2d" builtin="checker" width="256" height="256"
              rgb1="0.22 0.25 0.28" rgb2="0.12 0.14 0.16"/>
     <material name="ground_mat" texture="ground_tex" texrepeat="4 4" reflectance="0.08"/>
-    <mesh name="base_mesh" file="../meshes/FloatingBase.STL"/>
+    <mesh name="base_mesh" file="../meshes/BaseLink.STL"/>
     <mesh name="right_hip_mesh" file="../meshes/RightHip.STL"/>
     <mesh name="right_thigh_mesh" file="../meshes/RightThigh.STL"/>
     <mesh name="right_shin_mesh" file="../meshes/RightShin.STL"/>

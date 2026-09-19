@@ -23,7 +23,7 @@ COMMANDS = {
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("--task", default="QuasiOmnidirectionalWalkingTaskV2")
+    parser.add_argument("--task", default="WalkingTask")
     parser.add_argument("--seconds", type=float, default=10.)
     parser.add_argument("--replicas", type=int, default=8)
     parser.add_argument("--device", default="cuda:0")
