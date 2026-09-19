@@ -122,6 +122,78 @@ class TerminalVelocityCommand:
         )
 
 
+class JoystickVelocityCommand:
+    """Continuous vx/yaw command from the DualSense left analog stick."""
+
+    linear_velocity_limit = 0.10
+    yaw_velocity_limit = 0.40
+    stick_deadzone = 0.08
+    yaw_deadband_rad = math.radians(8.0)
+
+    def __init__(self):
+        self.target = np.zeros(3, dtype=np.float32)
+        self._pygame = None
+        self._joystick = None
+
+    def __enter__(self) -> JoystickVelocityCommand:
+        try:
+            import pygame
+        except ImportError as exc:
+            raise RuntimeError(
+                "pygame is required for --joystick; install it with `uv add pygame`"
+            ) from exc
+
+        pygame.init()
+        pygame.joystick.init()
+        if pygame.joystick.get_count() == 0:
+            pygame.quit()
+            raise RuntimeError(
+                "no joystick detected by pygame; under WSL try launching with "
+                "`SDL_JOYSTICK_DEVICE=/dev/input/js0`"
+            )
+
+        self._pygame = pygame
+        self._joystick = pygame.joystick.Joystick(0)
+        self._joystick.init()
+        print(f"Joystick: {self._joystick.get_name()}", flush=True)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+        if self._pygame is not None:
+            self._pygame.quit()
+
+    def poll(self) -> None:
+        assert self._pygame is not None and self._joystick is not None
+        self._pygame.event.pump()
+
+        x = float(self._joystick.get_axis(0))
+        y = -float(self._joystick.get_axis(1))  # pygame reports stick-up as negative Y
+        radius = min(1.0, math.hypot(x, y))
+
+        # Neutral stick, or the lower half-plane: stop.
+        if radius < self.stick_deadzone or y < 0.0:
+            self.target[:] = 0.0
+            return
+
+        # Angle is measured from straight up; clockwise/right is positive.
+        angle = math.atan2(x, y)
+        yaw = - self.yaw_velocity_limit * angle / (math.pi / 2.0)
+        if abs(angle) <= self.yaw_deadband_rad:
+            yaw = 0.0
+
+        self.target[:] = (
+            self.linear_velocity_limit * radius,
+            0.0,
+            float(np.clip(yaw, -self.yaw_velocity_limit, self.yaw_velocity_limit)),
+        )
+
+
 class PolicyController:
     """Frequency-decoupled state consumer and joint-command producer."""
 
@@ -193,9 +265,7 @@ class PolicyController:
             self.gait_phase_origin_ns = None
             self.joint_velocity_estimator.reset()
             self.estimator.reset()
-            target = self.profile.quantize_joint_position(
-                self.profile.array("default_joint_pos", dtype=np.float32)
-            )
+            target = self.profile.array("default_joint_pos", dtype=np.float32)
         else:
             default_pos = self.profile.array("default_joint_pos", dtype=np.float32)
             observed_position = self.profile.observed_joint_position(
@@ -265,6 +335,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vy", type=float, default=0.0)
     parser.add_argument("--yaw", type=float, default=0.0)
     parser.add_argument("--no-keyboard", action="store_true")
+    parser.add_argument(
+        "--joystick",
+        action="store_true",
+        help="use the first pygame joystick left stick for vx/yaw instead of keyboard input",
+    )
     return parser.parse_args()
 
 
@@ -300,8 +375,12 @@ def main() -> None:
         state_timeout_s=args.state_timeout,
         action_range_fraction=args.action_range_fraction,
     )
-    keyboard = TerminalVelocityCommand(
-        (args.vx, args.vy, args.yaw), profile, enabled=not args.no_keyboard
+    command_input = (
+        JoystickVelocityCommand()
+        if args.joystick
+        else TerminalVelocityCommand(
+            (args.vx, args.vy, args.yaw), profile, enabled=not args.no_keyboard
+        )
     )
     print(
         f"Loaded {backend} {profile.name} policy; "
@@ -310,23 +389,30 @@ def main() -> None:
         f"sending commands to {(args.robot_host, args.command_port)}",
         flush=True,
     )
-    print(
-        "Controller keys: W/S forward, A/D lateral, Q/E yaw, X stop "
-        "(0.01 steps; vx/vy +/-0.10, yaw +/-pi/4)",
-        flush=True,
-    )
+    if args.joystick:
+        print(
+            "Joystick: left stick radius -> vx 0..0.10 m/s; "
+            "angle from up -> yaw +/-0.40 rad/s",
+            flush=True,
+        )
+    else:
+        print(
+            "Controller keys: W/S forward, A/D lateral, Q/E yaw, X stop "
+            "(0.01 steps; vx/vy +/-0.10, yaw +/-pi/4)",
+            flush=True,
+        )
 
     next_control_ns = monotonic_time_ns()
     next_status_ns = next_control_ns + 1_000_000_000
     previous_received_count = 0
     try:
-        with keyboard:
+        with command_input:
             while True:
                 now_ns = monotonic_time_ns()
                 controller.receive_available_states(now_ns)
-                keyboard.poll()
+                command_input.poll()
                 if now_ns >= next_control_ns:
-                    command = controller.make_command(keyboard.target, now_ns)
+                    command = controller.make_command(command_input.target, now_ns)
                     transport.send_command(command)
                     next_control_ns += controller.period_ns
                     if now_ns - next_control_ns > controller.period_ns:
